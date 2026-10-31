@@ -1,0 +1,13 @@
+# Python 가상환경·캐시
+.venv/
+__pycache__/
+*.py[cod]
+
+# 환경변수·인증키
+.env
+.env.*
+!.env.example
+secrets/
+
+# 편집기 설정
+.vscode/
