@@ -28,6 +28,7 @@ class CartOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     size: Literal["regular", "large"] | None = None
+    ice: Literal["more", "regular", "less"] | None = None
 
 
 class CartItemAddRequest(BaseModel):
