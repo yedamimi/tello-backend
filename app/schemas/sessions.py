@@ -1,8 +1,9 @@
-"""주문 세션의 요청·응답 데이터 모델."""
+"""주문 세션·장바구니의 요청·응답 데이터 모델."""
 
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 
 class SessionCreateRequest(BaseModel):
     """세션 생성 요청."""
@@ -10,7 +11,7 @@ class SessionCreateRequest(BaseModel):
     store_id: str = Field(
         alias="storeId",
         min_length=1,
-        pattern=r"^[A-Za-z0-9_-]+$"
+        pattern=r"^[A-Za-z0-9_-]+$",
     )
 
 
@@ -23,11 +24,12 @@ class SessionCreateResponse(BaseModel):
 
 
 class CartOptions(BaseModel):
-    """장바구니에서 선택할 옵션."""
+    """장바구니에서 선택할 크기·온도·얼음 옵션."""
 
     model_config = ConfigDict(extra="forbid")
 
     size: Literal["regular", "large"] | None = None
+    temperature: Literal["hot", "ice"] | None = None
     ice: Literal["more", "regular", "less"] | None = None
 
 
@@ -46,7 +48,8 @@ class CartItemAddRequest(BaseModel):
         alias="selectedOptions",
         default_factory=CartOptions,
     )
-    
+
+
 class CartItemUpdateRequest(BaseModel):
     """장바구니에서 변경할 값만 받는다."""
 
