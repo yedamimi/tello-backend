@@ -43,6 +43,7 @@ def get_menu_list(store_id: str, category: str = None) -> list:
         menu = {
             "menuId": menu_id,
             **menu_info,
+            "isAvailable": menu_info.get("isAvailable", True),
         }
 
 # 카테고리가 전달된 경우 해당 카테고리만 선택
