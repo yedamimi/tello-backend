@@ -16,6 +16,7 @@ from app.services.sessions import (
     add_cart_item,
     update_cart_item,
     delete_cart_item,
+    clear_cart,
 )
 
 router = APIRouter(
@@ -321,6 +322,58 @@ def remove_cart_item(
         return JSONResponse(
             status_code=status_code,
             content={"code": code, "message": message},
+            headers=(
+                {"WWW-Authenticate": "Bearer"}
+                if status_code == 401
+                else None
+            ),
+        )
+        
+
+@router.delete("/{sessionId}/cart")
+def clear_session_cart(
+    session_id: str = Path(
+        alias="sessionId",
+        pattern=r"^[a-f0-9]{32}$",
+    ),
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        bearer_scheme
+    ),
+):
+    """세션의 장바구니를 전체 비우고 갱신된 결과를 반환한다."""
+
+    session_token = (
+        credentials.credentials if credentials else ""
+    )
+
+    try:
+        return clear_cart(session_id, session_token)
+
+    except ValueError as exc:
+        code = str(exc)
+
+        errors = {
+            "SESSION_UNAUTHORIZED": (
+                401,
+                "주문 세션 인증을 확인해 주세요.",
+            ),
+            "SESSION_INACTIVE": (
+                409,
+                "현재 사용할 수 없는 주문 세션이에요.",
+            ),
+        }
+
+        if code not in errors:
+            raise
+
+        status_code, message = errors[code]
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "code": code,
+                "message": message,
+            },
             headers=(
                 {"WWW-Authenticate": "Bearer"}
                 if status_code == 401

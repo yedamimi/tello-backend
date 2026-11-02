@@ -17,9 +17,7 @@ def _get_authenticated_session(
     if not session_token:
         raise ValueError("SESSION_UNAUTHORIZED")
 
-    session = get_db_reference(
-        f"sessions/{session_id}"
-    ).get()
+    session = get_db_reference(f"sessions/{session_id}").get()
 
     if session is None:
         raise ValueError("SESSION_UNAUTHORIZED")
@@ -62,42 +60,27 @@ def _calculate_unit_price(menu: dict, options: dict) -> int:
 
     extra_price = 0
 
-    # 크기 옵션이 있는 메뉴는 크기를 반드시 선택
     if size_options:
         size_id = options.get("size")
-
         if size_id not in size_options:
             raise ValueError("CART_OPTION_INVALID")
-
         extra_price += size_options[size_id]["extraPrice"]
-
     elif "size" in options:
         raise ValueError("CART_OPTION_INVALID")
 
-    # 온도 옵션이 있는 메뉴는 온도를 반드시 선택
     if temperature_options:
         temperature_id = options.get("temperature")
-
         if temperature_id not in temperature_options:
             raise ValueError("CART_OPTION_INVALID")
-
-        extra_price += temperature_options[
-            temperature_id
-        ]["extraPrice"]
-
+        extra_price += temperature_options[temperature_id]["extraPrice"]
     elif "temperature" in options:
         raise ValueError("CART_OPTION_INVALID")
 
-    # 아이스는 얼음 선택 필수
     if options.get("temperature") == "ice":
         ice_id = options.get("ice")
-
         if ice_id not in ice_options:
             raise ValueError("CART_OPTION_INVALID")
-
         extra_price += ice_options[ice_id]["extraPrice"]
-
-    # 핫 또는 옵션 없는 메뉴에는 얼음 선택 불가
     elif "ice" in options:
         raise ValueError("CART_OPTION_INVALID")
 
@@ -117,7 +100,6 @@ def create_session(store_id: str) -> dict:
 
     session_id = uuid4().hex
     session_token = secrets.token_urlsafe(32)
-
     token_hash = hashlib.sha256(
         session_token.encode("utf-8")
     ).hexdigest()
@@ -137,38 +119,58 @@ def create_session(store_id: str) -> dict:
 
 
 def get_session_cart(session_id: str, session_token: str) -> dict:
-    """인증 후 장바구니 항목과 금액을 반환한다."""
+    """품절·삭제된 메뉴도 표시하여 사용자가 장바구니를 복구하도록 한다."""
 
-    session = _get_authenticated_session(
-        session_id,
-        session_token,
-    )
-
+    session = _get_authenticated_session(session_id, session_token)
     store_id = session["storeId"]
     cart = session.get("cart") or {}
     saved_items = cart.get("items") or {}
 
     items = []
     total_price = 0
+    has_unavailable_items = False
 
     for item_id, item in saved_items.items():
         menu_id = item["menuId"]
-
         menu = get_db_reference(
             f"menus/{store_id}/{menu_id}"
         ).get()
 
-        if menu is None or menu.get("isAvailable") is not True:
-            raise ValueError("CART_MENU_UNAVAILABLE")
+        is_available = (
+            menu is not None
+            and menu.get("isAvailable") is True
+        )
+        if not is_available:
+            has_unavailable_items = True
 
         options = item.get("selectedOptions") or {}
         quantity = item["quantity"]
-
         _validate_quantity(quantity)
-        unit_price = _calculate_unit_price(menu, options)
 
-        subtotal = unit_price * quantity
-        total_price += subtotal
+        if menu is None:
+            items.append({
+                "itemId": item_id,
+                "menuId": menu_id,
+                "name": "판매 종료된 메뉴",
+                "quantity": quantity,
+                "selectedOptions": options,
+                "unitPrice": None,
+                "subtotal": None,
+                "isAvailable": False,
+            })
+            continue
+
+        try:
+            unit_price = _calculate_unit_price(menu, options)
+            subtotal = unit_price * quantity
+        except (ValueError, KeyError, TypeError):
+            has_unavailable_items = True
+            is_available = False
+            unit_price = None
+            subtotal = None
+
+        if is_available and subtotal is not None:
+            total_price += subtotal
 
         items.append({
             "itemId": item_id,
@@ -178,12 +180,14 @@ def get_session_cart(session_id: str, session_token: str) -> dict:
             "selectedOptions": options,
             "unitPrice": unit_price,
             "subtotal": subtotal,
+            "isAvailable": is_available,
         })
 
     return {
         "sessionId": session_id,
         "items": items,
         "totalPrice": total_price,
+        "canCheckout": not has_unavailable_items,
     }
 
 
@@ -196,13 +200,8 @@ def add_cart_item(
 ) -> dict:
     """메뉴·수량·옵션을 검증하고 새 항목을 추가한다."""
 
-    session = _get_authenticated_session(
-        session_id,
-        session_token,
-    )
-
+    session = _get_authenticated_session(session_id, session_token)
     store_id = session["storeId"]
-
     menu = get_db_reference(
         f"menus/{store_id}/{menu_id}"
     ).get()
@@ -216,11 +215,9 @@ def add_cart_item(
     _validate_quantity(quantity)
     _calculate_unit_price(menu, selected_options)
 
-    # 기존 장바구니가 정상인지 저장 전에 확인
     get_session_cart(session_id, session_token)
 
     item_id = uuid4().hex
-
     get_db_reference(
         f"sessions/{session_id}/cart/items/{item_id}"
     ).set({
@@ -240,15 +237,10 @@ def update_cart_item(
 ) -> dict:
     """기존 옵션을 유지하며 전달받은 값만 변경한다."""
 
-    session = _get_authenticated_session(
-        session_id,
-        session_token,
-    )
-
+    session = _get_authenticated_session(session_id, session_token)
     item_ref = get_db_reference(
         f"sessions/{session_id}/cart/items/{item_id}"
     )
-
     current_item = item_ref.get()
 
     if current_item is None:
@@ -256,7 +248,6 @@ def update_cart_item(
 
     store_id = session["storeId"]
     menu_id = current_item["menuId"]
-
     menu = get_db_reference(
         f"menus/{store_id}/{menu_id}"
     ).get()
@@ -264,19 +255,13 @@ def update_cart_item(
     if menu is None or menu.get("isAvailable") is not True:
         raise ValueError("CART_MENU_UNAVAILABLE")
 
-    quantity = changes.get(
-        "quantity",
-        current_item["quantity"],
-    )
-
+    quantity = changes.get("quantity", current_item["quantity"])
     options = dict(current_item.get("selectedOptions") or {})
 
     if "selectedOptions" in changes:
         changed_options = changes["selectedOptions"]
         options.update(changed_options)
 
-        # 아이스 → 핫 변경 시 이전 얼음 옵션 제거
-        # 핫과 얼음을 명시적으로 함께 보내면 아래 검증에서 거절
         if (
             changed_options.get("temperature") == "hot"
             and "ice" not in changed_options
@@ -299,10 +284,9 @@ def delete_cart_item(
     session_token: str,
     item_id: str,
 ) -> dict:
-    """인증 후 항목을 삭제한다. 품절 항목도 삭제 가능하다."""
+    """품절 항목을 포함해 개별 장바구니 항목을 삭제한다."""
 
     _get_authenticated_session(session_id, session_token)
-
     item_ref = get_db_reference(
         f"sessions/{session_id}/cart/items/{item_id}"
     )
@@ -311,5 +295,18 @@ def delete_cart_item(
         raise ValueError("CART_ITEM_NOT_FOUND")
 
     item_ref.delete()
+    return get_session_cart(session_id, session_token)
+
+
+def clear_cart(
+    session_id: str,
+    session_token: str,
+) -> dict:
+    """세션 인증 후 장바구니의 모든 항목을 삭제한다."""
+
+    _get_authenticated_session(session_id, session_token)
+    get_db_reference(
+        f"sessions/{session_id}/cart/items"
+    ).delete()
 
     return get_session_cart(session_id, session_token)
