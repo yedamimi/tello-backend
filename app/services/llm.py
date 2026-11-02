@@ -1,3 +1,4 @@
+
 """Gemini를 이용한 주문 문장 분석."""
 
 import json
@@ -6,7 +7,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai._gaos.lib.compat_errors import APITimeoutError
+from google.genai._gaos.lib.compat_errors import (
+    APIError,
+    APITimeoutError,
+)
 from pydantic import ValidationError
 
 from app.repositories.store_repository import (
@@ -188,16 +192,13 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
     if not model_name:
         raise ValueError("GEMINI_MODEL_MISSING")
 
-    
     print("1. Firebase 매장 및 메뉴 조회 시작", flush=True)
 
-    # 매장이 실제로 존재하는지 확인
     store = get_store(store_id)
 
     if store is None:
         raise ValueError("STORE_NOT_FOUND")
 
-    # 해당 매장의 메뉴 조회
     menus = get_store_menus(store_id)
 
     if not menus:
@@ -205,11 +206,6 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
 
     print("2. Firebase 매장 및 메뉴 조회 완료", flush=True)
 
-
-    if not menus:
-        raise ValueError("MENU_NOT_FOUND")
-
-    # 분석에 필요한 메뉴 정보만 전달한다.
     catalog = [
         {
             "menuId": menu_id,
@@ -236,7 +232,6 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
     print("3. Gemini 연결 준비", flush=True)
     print(f"사용 모델: {model_name}", flush=True)
 
-    # Gemini 클라이언트 시간 초과를 구분해서 처리한다.
     try:
         with genai.Client(api_key=api_key) as client:
             print("4. Gemini 분석 요청 시작", flush=True)
@@ -267,16 +262,18 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
     except APITimeoutError as exc:
         raise ValueError("LLM_TIMEOUT") from exc
 
+    except APIError as exc:
+        raise ValueError("LLM_API_ERROR") from exc
+
     if not output_text or not output_text.strip():
         raise ValueError("LLM_EMPTY_RESPONSE")
 
-    # 잘린 JSON이나 필수 필드 누락 등은 분석 실패로 처리한다.
     try:
         result = OrderAnalysis.model_validate_json(output_text)
-    except ValidationError as exc:
+
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("LLM_INVALID_RESPONSE") from exc
 
-    # 반환된 메뉴 ID가 실제 DB에 있는지 다시 확인한다.
     for item in result.items:
         if (
             item.menu_id is not None
