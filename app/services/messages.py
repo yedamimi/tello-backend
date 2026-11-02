@@ -18,6 +18,11 @@ from app.services.voice_cart import (
     process_voice_cart_command,
     confirm_voice_clear,
 )
+from app.services.recommendations import (
+    is_recommendation_request,
+    recommend_menus,
+)
+
 
 
 OPTION_FIELDS = ("size", "temperature", "ice")
@@ -470,6 +475,8 @@ def resolve_followup(
             for key in OPTION_FIELDS
         }
 
+        data.setdefault("quantity", None)
+
         updated_items.append(
             AnalyzedItem.model_validate(data)
         )
@@ -652,10 +659,18 @@ def process_order_message(
                 "nextAction": "clarification",
             }
     else:
+        # 명시적인 메뉴 추천은 Gemini 없이 처리
+        if is_recommendation_request(text):
+            return recommend_menus(
+                store_id=store_id,
+                text=text,
+            )
+
         analysis = analyze_order_text(
             store_id=store_id,
             text=text,
         )
+
 
     # 4. 변경·삭제·전체 비우기 명령
     if analysis.intent in (
