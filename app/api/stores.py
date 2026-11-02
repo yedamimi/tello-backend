@@ -79,7 +79,7 @@ def read_store(store_id: str):
 
 # 전체 메뉴 또는 카테코리별 메뉴 조회하는 API
 @router.get(
-        "/{store_id}/menus",
+        "/{store_id}/menu",
         summary="Get Store Menus",
         description="매장 ID를 이용해 전체 메뉴 또는 카테고리별 메뉴를 조회한다"
             )
