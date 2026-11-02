@@ -36,12 +36,11 @@ class OrderCreateResponse(BaseModel):
         "pending",
         "preparing",
         "completed",
-        "cancelled",
     ]
     image_id: Literal[
-        "square",
-        "triangle",
-        "circle",
+        "order_complete",
+        "preparing",
+        "ready",
     ] = Field(alias="imageId")
     items: list[OrderItemResponse]
     total_price: int = Field(alias="totalPrice")
@@ -57,12 +56,11 @@ class OrderReadResponse(BaseModel):
         "pending",
         "preparing",
         "completed",
-        "cancelled",
     ]
     image_id: Literal[
-        "square",
-        "triangle",
-        "circle",
+        "order_complete",
+        "preparing",
+        "ready",
     ] = Field(alias="imageId")
     items: list[OrderItemResponse]
     total_price: int = Field(alias="totalPrice")

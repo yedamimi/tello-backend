@@ -11,7 +11,23 @@ from app.services.sessions import (
     _calculate_unit_price,
     _validate_quantity,
 )
+# 주문 상태별 이미지 ID
+ORDER_STATUS_IMAGES = {
+    "pending": "order_complete",
+    "preparing": "preparing",
+    "completed": "ready",
+}
 
+
+def get_status_image(status: str) -> str:
+    """주문 상태에 맞는 이미지 ID를 반환한다."""
+
+    image_id = ORDER_STATUS_IMAGES.get(status)
+
+    if image_id is None:
+        raise ValueError("ORDER_STATUS_INVALID")
+
+    return image_id
 
 def _hash_idempotency_key(key: str) -> str:
     """중복 방지 키를 해시한다."""
@@ -94,11 +110,7 @@ def _build_order(
         "sessionId": session_id,
         "storeId": session["storeId"],
         "status": "pending",
-        "imageId": secrets.choice([
-            "square",
-            "triangle",
-            "circle",
-        ]),
+        "imageId": get_status_image("pending"),
         "items": items,
         "totalPrice": total_price,
         "createdAt": time.time_ns() // 1_000_000,
@@ -319,5 +331,10 @@ def get_order(
 
     if not order:
         raise ValueError("ORDER_NOT_FOUND")
+
+    # 현재 주문 상태에 맞는 이미지 ID 반환 
+    order["imageId"] = get_status_image(
+        order["status"]
+    )
 
     return order
