@@ -1,7 +1,7 @@
 
-"""음성 주문 메시지 API."""
+"""음성 주문 분석 및 미완성 주문 취소 API."""
 
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Depends, Header, Path
 from fastapi.responses import JSONResponse
 from fastapi.security import (
     HTTPAuthorizationCredentials,
@@ -9,7 +9,10 @@ from fastapi.security import (
 )
 
 from app.schemas.messages import MessageRequest
-from app.services.messages import process_order_message
+from app.services.messages import (
+    cancel_pending_order,
+    process_order_message,
+)
 
 
 router = APIRouter(
@@ -39,8 +42,8 @@ ERRORS = {
     "MESSAGE_TEXT_INVALID": (
         422, "올바른 주문 문장을 입력해 주세요."
     ),
-    "CART_ITEM_NOT_FOUND": (
-        404, "장바구니 항목을 찾을 수 없어요."
+    "MESSAGE_NO_ITEMS": (
+        422, "추가할 메뉴를 확인할 수 없어요."
     ),
     "CART_MENU_UNAVAILABLE": (
         409, "판매할 수 없는 메뉴가 있어요."
@@ -54,9 +57,6 @@ ERRORS = {
     "PENDING_ORDER_INVALID": (
         409, "이전 주문 정보를 확인할 수 없어요."
     ),
-    "FOLLOWUP_NOT_RESOLVED": (
-        409, "답변을 이해하지 못했어요. 다시 말씀해 주세요."
-    ),
     "LLM_TIMEOUT": (
         504, "주문 분석 시간이 초과됐어요."
     ),
@@ -69,7 +69,47 @@ ERRORS = {
     "LLM_API_ERROR": (
         502, "주문 분석 서비스에 문제가 발생했어요."
     ),
+    "GEMINI_API_KEY_MISSING": (
+        503, "주문 분석 서비스 설정을 확인해 주세요."
+    ),
+    "GEMINI_MODEL_MISSING": (
+        503, "주문 분석 모델 설정을 확인해 주세요."
+    ),
 }
+
+
+def get_session_token(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str:
+    if not credentials:
+        return ""
+
+    if credentials.scheme.lower() != "bearer":
+        return ""
+
+    return credentials.credentials
+
+
+def error_response(exc: ValueError):
+    code = str(exc)
+
+    if code not in ERRORS:
+        raise exc
+
+    status_code, message = ERRORS[code]
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": code,
+            "message": message,
+        },
+        headers=(
+            {"WWW-Authenticate": "Bearer"}
+            if status_code == 401
+            else None
+        ),
+    )
 
 
 @router.post("/{sessionId}/messages")
@@ -83,39 +123,38 @@ def analyze_message(
         bearer_scheme
     ),
 ):
-    """고객 메시지를 분석하고 주문 상태를 처리한다."""
+    """메시지 분석 및 주문 처리."""
 
-    session_token = (
-        credentials.credentials
-        if credentials
-        and credentials.scheme.lower() == "bearer"
-        else ""
-    )
+    token = get_session_token(credentials)
 
     try:
         return process_order_message(
             session_id=session_id,
-            session_token=session_token,
+            session_token=token,
             text=request.text,
         )
-
     except ValueError as exc:
-        code = str(exc)
+        return error_response(exc)
 
-        if code not in ERRORS:
-            raise
 
-        status_code, message = ERRORS[code]
+@router.delete("/{sessionId}/pending-order")
+def delete_pending_order(
+    session_id: str = Path(
+        alias="sessionId",
+        pattern=r"^[a-f0-9]{32}$",
+    ),
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        bearer_scheme
+    ),
+):
+    """음성 주문 도중 메뉴판 전환 시 미완성 주문만 삭제."""
 
-        return JSONResponse(
-            status_code=status_code,
-            content={
-                "code": code,
-                "message": message,
-            },
-            headers=(
-                {"WWW-Authenticate": "Bearer"}
-                if status_code == 401
-                else None
-            ),
+    token = get_session_token(credentials)
+
+    try:
+        return cancel_pending_order(
+            session_id=session_id,
+            session_token=token,
         )
+    except ValueError as exc:
+        return error_response(exc)

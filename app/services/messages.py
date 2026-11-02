@@ -1,32 +1,69 @@
 
-"""Gemini 주문 분석 결과 검증 및 장바구니 연동 서비스."""
+"""LLM 주문 검증, 후속 대화 및 장바구니 연동."""
 
 import re
 from uuid import uuid4
 
 from app.core.firebase import get_db_reference
 from app.repositories.store_repository import get_store_menus
-from app.schemas.messages import (
-    AnalyzedItem,
-    OrderAnalysis,
-)
+from app.schemas.messages import AnalyzedItem, OrderAnalysis
+from app.services.llm import analyze_order_text
 from app.services.sessions import (
-    _get_authenticated_session,
     _calculate_unit_price,
+    _get_authenticated_session,
     _validate_quantity,
     get_session_cart,
 )
-from app.services.llm import analyze_order_text
 
 
 OPTION_FIELDS = ("size", "temperature", "ice")
+
+FIELD_PRIORITY = {
+    "menuId": 0,
+    "size": 1,
+    "temperature": 2,
+    "ice": 3,
+    "quantity": 4,
+    "options": 5,
+}
+
+YES_ANSWERS = {
+    "네", "예", "응", "좋아요",
+    "더주문할게요", "더주문할래요",
+    "추가주문", "추가할게요",
+}
+
+NO_ANSWERS = {
+    "아니요", "아니", "아뇨", "아니에요",
+    "주문확인하기", "주문확인할게요",
+    "주문끝났어요", "이제됐어요",
+    "그만주문할게요",
+}
+
+
+def _normalize(text: str) -> str:
+    """공백 및 마지막 문장부호 정리."""
+    return re.sub(r"[\s.!?]+", "", text.strip())
+
+
+def _add_issue(
+    issues: list,
+    index: int,
+    code: str,
+    field: str,
+) -> None:
+    issues.append({
+        "itemIndex": index,
+        "code": code,
+        "field": field,
+    })
 
 
 def validate_order_analysis(
     store_id: str,
     analysis: OrderAnalysis,
 ) -> dict:
-    """Gemini 분석 결과의 메뉴·수량·옵션을 검증한다."""
+    """메뉴, 품절, 필수 옵션, 수량 검증."""
 
     items = [
         item.model_dump()
@@ -48,34 +85,23 @@ def validate_order_analysis(
 
     for index, item in enumerate(items):
         menu_id = item.get("menu_id")
+        menu = menus.get(menu_id)
 
-        if not menu_id or menu_id not in menus:
-            issues.append({
-                "itemIndex": index,
-                "code": "MENU_UNKNOWN",
-                "field": "menuId",
-            })
+        if not isinstance(menu, dict):
+            _add_issue(
+                issues, index, "MENU_UNKNOWN", "menuId"
+            )
             continue
-
-        menu = menus[menu_id]
 
         if menu.get("isAvailable") is not True:
-            issues.append({
-                "itemIndex": index,
-                "code": "MENU_SOLD_OUT",
-                "field": "menuId",
-            })
+            _add_issue(
+                issues, index, "MENU_SOLD_OUT", "menuId"
+            )
             continue
-
-        if item.get("quantity") is None:
-            issues.append({
-                "itemIndex": index,
-                "code": "QUANTITY_REQUIRED",
-                "field": "quantity",
-            })
 
         options = item.get("options") or {}
 
+        # 크기 → 온도
         for field, db_field in (
             ("size", "sizeOptions"),
             ("temperature", "temperatureOptions"),
@@ -84,79 +110,90 @@ def validate_order_analysis(
             value = options.get(field)
 
             if allowed and value is None:
-                issues.append({
-                    "itemIndex": index,
-                    "code": "OPTION_REQUIRED",
-                    "field": field,
-                })
-
+                _add_issue(
+                    issues, index,
+                    "OPTION_REQUIRED", field
+                )
             elif value is not None and value not in allowed:
-                issues.append({
-                    "itemIndex": index,
-                    "code": "OPTION_INVALID",
-                    "field": field,
-                })
+                _add_issue(
+                    issues, index,
+                    "OPTION_INVALID", field
+                )
 
+        # 얼음: 아이스이면서 얼음 옵션이 있을 때
         ice = options.get("ice")
         ice_options = menu.get("iceOptions") or {}
 
         if options.get("temperature") == "ice":
             if ice_options and ice is None:
-                issues.append({
-                    "itemIndex": index,
-                    "code": "OPTION_REQUIRED",
-                    "field": "ice",
-                })
-
+                _add_issue(
+                    issues, index,
+                    "OPTION_REQUIRED", "ice"
+                )
             elif ice is not None and ice not in ice_options:
-                issues.append({
-                    "itemIndex": index,
-                    "code": "OPTION_INVALID",
-                    "field": "ice",
-                })
-
+                _add_issue(
+                    issues, index,
+                    "OPTION_INVALID", "ice"
+                )
         elif ice is not None:
-            issues.append({
-                "itemIndex": index,
-                "code": "OPTION_INVALID",
-                "field": "ice",
-            })
+            _add_issue(
+                issues, index,
+                "OPTION_INVALID", "ice"
+            )
 
-        # 기존 장바구니 검증 함수를 재사용한다.
-        if not any(
-            issue["itemIndex"] == index
-            for issue in issues
-        ):
+        # 수량은 옵션을 모두 확인한 뒤 마지막에 질문
+        quantity = item.get("quantity")
+
+        if quantity is None:
+            _add_issue(
+                issues, index,
+                "QUANTITY_REQUIRED", "quantity"
+            )
+        else:
             try:
-                _validate_quantity(item["quantity"])
-
-                selected_options = {
-                    key: value
-                    for key, value in options.items()
-                    if value is not None
-                }
-
-                _calculate_unit_price(
-                    menu,
-                    selected_options,
+                _validate_quantity(quantity)
+            except (ValueError, TypeError):
+                _add_issue(
+                    issues, index,
+                    "QUANTITY_INVALID", "quantity"
                 )
 
-            except (ValueError, KeyError, TypeError):
-                issues.append({
-                    "itemIndex": index,
-                    "code": "OPTION_INVALID",
-                    "field": "options",
-                })
+        # 필수 옵션 및 수량이 정상일 때 가격 검증
+        item_has_issue = any(
+            issue["itemIndex"] == index
+            for issue in issues
+        )
+
+        if not item_has_issue:
+            selected = {
+                field: value
+                for field, value in options.items()
+                if value is not None
+            }
+
+            try:
+                _calculate_unit_price(menu, selected)
+            except (ValueError, TypeError, KeyError):
+                _add_issue(
+                    issues, index,
+                    "OPTION_INVALID", "options"
+                )
+
+    issues.sort(
+        key=lambda issue: (
+            issue["itemIndex"],
+            FIELD_PRIORITY.get(issue["field"], 99),
+        )
+    )
 
     result["needsClarification"] = bool(issues)
-
     return result
 
 
 def generate_clarification_question(
     result: dict,
 ) -> str | None:
-    """누락 정보에 대한 추가 질문을 생성한다."""
+    """우선순위가 가장 높은 누락 정보 질문."""
 
     issues = result.get("issues") or []
 
@@ -184,52 +221,33 @@ def generate_clarification_question(
             "다른 메뉴를 말씀해 주세요."
         )
 
-    if code == "QUANTITY_REQUIRED":
-        return (
-            f"{name}는 몇 잔 또는 "
-            "몇 개 주문하시겠어요?"
-        )
+    if code in ("QUANTITY_REQUIRED", "QUANTITY_INVALID"):
+        return f"{name}는 몇 개 주문하시겠어요?"
 
-    if code == "OPTION_REQUIRED":
-        questions = {
-            "size": (
-                f"{name}는 보통 크기와 큰 크기 중 "
-                "어떤 걸로 드릴까요?"
-            ),
-            "temperature": (
-                f"{name}는 따뜻한 것과 차가운 것 중 "
-                "어떤 걸로 드릴까요?"
-            ),
-            "ice": (
-                f"{name}의 얼음은 많이, 보통, 적게 중 "
-                "어떻게 드릴까요?"
-            ),
-        }
-
-        return questions.get(
-            field,
-            "옵션을 선택해 주세요.",
-        )
-
-    field_names = {
-        "size": "크기",
-        "temperature": "온도",
-        "ice": "얼음",
+    questions = {
+        "size": f"{name}의 크기를 골라 주세요.",
+        "temperature": (
+            f"{name}는 따뜻하게 드릴까요, "
+            "차갑게 드릴까요?"
+        ),
+        "ice": f"{name}의 얼음은 얼마나 넣을까요?",
     }
 
-    field_name = field_names.get(field, field)
+    if code == "OPTION_REQUIRED":
+        return questions.get(
+            field, "옵션을 선택해 주세요."
+        )
 
-    return (
-        f"{name}의 {field_name} 선택을 "
-        "다시 말씀해 주세요."
-    )
+    if code == "OPTION_INVALID":
+        return questions.get(
+            field, "옵션을 다시 선택해 주세요."
+        )
+
+    return "주문 내용을 다시 말씀해 주세요."
 
 
-def get_pending_order(
-    session_id: str,
-) -> dict | None:
-    """Firebase의 미완성 주문을 조회한다."""
-
+def get_pending_order(session_id: str) -> dict | None:
+    """미완성 음성 주문 조회."""
     return get_db_reference(
         f"sessions/{session_id}/pendingOrder"
     ).get()
@@ -239,7 +257,7 @@ def save_pending_order(
     session_id: str,
     result: dict,
 ) -> None:
-    """추가 질문이 필요한 주문을 임시 저장한다."""
+    """추가 질문이 필요한 주문 저장."""
 
     if result["intent"] != "add_item":
         return
@@ -260,84 +278,118 @@ def save_pending_order(
     })
 
 
-def clear_pending_order(
-    session_id: str,
-) -> None:
-    """미완성 주문 정보를 삭제한다."""
-
+def clear_pending_order(session_id: str) -> None:
+    """미완성 주문 삭제. 장바구니는 유지."""
     get_db_reference(
         f"sessions/{session_id}/pendingOrder"
     ).delete()
+
+
+def get_dialog_state(session_id: str) -> str | None:
+    """추가 주문 여부를 기다리는 대화 상태 조회."""
+    return get_db_reference(
+        f"sessions/{session_id}/dialogState"
+    ).get()
+
+
+def set_dialog_state(
+    session_id: str,
+    state: str | None,
+) -> None:
+    """추가 주문 대화 상태 저장 및 삭제."""
+
+    ref = get_db_reference(
+        f"sessions/{session_id}/dialogState"
+    )
+
+    if state is None:
+        ref.delete()
+    else:
+        ref.set(state)
+
+
+def cancel_pending_order(
+    session_id: str,
+    session_token: str,
+) -> dict:
+    """인증 후 진행 중인 음성 주문만 취소."""
+
+    _get_authenticated_session(
+        session_id,
+        session_token,
+    )
+
+    clear_pending_order(session_id)
+    set_dialog_state(session_id, None)
+
+    return {
+        "cancelled": True,
+        "cart": get_session_cart(
+            session_id,
+            session_token,
+        ),
+    }
 
 
 def _read_followup_value(
     text: str,
     field: str,
 ):
-    """짧고 명확한 후속 답변의 값을 추출한다."""
+    """버튼 또는 짧은 음성 답변 해석."""
 
-    normalized = re.sub(
-        r"\s+",
-        "",
-        text.strip(),
-    )
+    value = _normalize(text)
 
     if field == "quantity":
         match = re.fullmatch(
-            (
-                r"(하나|한|둘|두|셋|세|넷|네|[1-9][0-9]*)"
-                r"(잔|장|개|잔이요|장이요|개요|"
-                r"이요|요|잔주세요|개주세요|"
-                r"개만|잔만|장만)?"
-            ),
-            normalized,
+            r"(하나|한|둘|두|셋|세|넷|네|[1-9][0-9]*)"
+            r"(잔|장|개)?"
+            r"(이요|요|주세요|만)?",
+            value,
         )
 
-        if match is None:
+        if not match:
             return None
 
         numbers = {
-            "하나": 1,
-            "한": 1,
-            "둘": 2,
-            "두": 2,
-            "셋": 3,
-            "세": 3,
-            "넷": 4,
-            "네": 4,
+            "하나": 1, "한": 1,
+            "둘": 2, "두": 2,
+            "셋": 3, "세": 3,
+            "넷": 4, "네": 4,
         }
 
         word = match.group(1)
 
-        if word.isdigit():
-            return int(word)
+        return (
+            int(word)
+            if word.isdigit()
+            else numbers.get(word)
+        )
 
-        return numbers.get(word)
-
-    values = {
+    choices = {
         "size": {
+            "보통": "regular",
+            "보통이요": "regular",
+            "보통크기": "regular",
+            "레귤러": "regular",
+            "레귤러요": "regular",
+            "큰사이즈": "large",
+            "큰사이즈요": "large",
             "큰걸로": "large",
             "큰걸로요": "large",
             "라지": "large",
             "라지요": "large",
-            "큰사이즈": "large",
-            "큰사이즈요": "large",
-            "보통": "regular",
-            "보통이요": "regular",
-            "레귤러": "regular",
-            "레귤러요": "regular",
         },
         "temperature": {
-            "아이스": "ice",
-            "아이스요": "ice",
-            "차가운거": "ice",
-            "차가운거요": "ice",
-            "차갑게": "ice",
+            "핫": "hot",
+            "핫이요": "hot",
             "따뜻하게": "hot",
             "따뜻한거": "hot",
             "따뜻한거요": "hot",
-            "핫": "hot",
-            "핫이요": "hot",
+            "아이스": "ice",
+            "아이스요": "ice",
+            "차갑게": "ice",
+            "차가운거": "ice",
+            "차가운거요": "ice",
         },
         "ice": {
             "적게": "less",
@@ -352,14 +404,14 @@ def _read_followup_value(
         },
     }
 
-    return values.get(field, {}).get(normalized)
+    return choices.get(field, {}).get(value)
 
 
 def resolve_followup(
     pending: dict,
     answer: str,
 ) -> OrderAnalysis | None:
-    """후속 답변을 미완성 주문의 해당 항목에 반영한다."""
+    """기존 주문의 다음 누락 필드에 답변 반영."""
 
     issues = pending.get("issues") or []
     items = pending.get("items") or []
@@ -368,42 +420,36 @@ def resolve_followup(
         return None
 
     issue = issues[0]
-
     index = issue.get("itemIndex")
-    code = issue.get("code")
     field = issue.get("field")
 
     if (
         type(index) is not int
-        or not 0 <= index < len(items)
+        or index < 0
+        or index >= len(items)
     ):
         return None
 
-    if code not in (
-        "QUANTITY_REQUIRED",
+    if issue.get("code") not in (
         "OPTION_REQUIRED",
         "OPTION_INVALID",
+        "QUANTITY_REQUIRED",
+        "QUANTITY_INVALID",
     ):
         return None
 
-    if (
-        code == "OPTION_INVALID"
-        and field not in OPTION_FIELDS
-    ):
+    if field not in (*OPTION_FIELDS, "quantity"):
         return None
 
-    value = _read_followup_value(
-        answer,
-        field,
-    )
+    value = _read_followup_value(answer, field)
 
     if value is None:
         return None
 
     updated_items = []
 
-    for position, old_item in enumerate(items):
-        data = dict(old_item)
+    for position, previous in enumerate(items):
+        data = dict(previous)
         options = dict(data.get("options") or {})
 
         if position == index:
@@ -412,10 +458,7 @@ def resolve_followup(
             else:
                 options[field] = value
 
-                if (
-                    field == "temperature"
-                    and value == "hot"
-                ):
+                if field == "temperature" and value == "hot":
                     options["ice"] = None
 
         data["options"] = {
@@ -438,7 +481,7 @@ def add_analyzed_items(
     session_token: str,
     items: list[dict],
 ) -> dict:
-    """검증된 주문 항목을 하나의 트랜잭션으로 추가한다."""
+    """검증된 음성 주문을 장바구니에 추가."""
 
     session = _get_authenticated_session(
         session_id,
@@ -455,7 +498,7 @@ def add_analyzed_items(
         menu = menus.get(menu_id)
 
         if (
-            not menu
+            not isinstance(menu, dict)
             or menu.get("isAvailable") is not True
         ):
             raise ValueError("CART_MENU_UNAVAILABLE")
@@ -464,8 +507,8 @@ def add_analyzed_items(
         _validate_quantity(quantity)
 
         selected_options = {
-            key: value
-            for key, value in (
+            field: value
+            for field, value in (
                 item.get("options") or {}
             ).items()
             if value is not None
@@ -476,29 +519,25 @@ def add_analyzed_items(
             selected_options,
         )
 
-        item_id = uuid4().hex
-
-        additions[item_id] = {
+        additions[uuid4().hex] = {
             "menuId": menu_id,
             "quantity": quantity,
-            "selectedOptions": (
-                selected_options or None
-            ),
+            "selectedOptions": selected_options,
         }
 
     if not additions:
         raise ValueError("MESSAGE_NO_ITEMS")
 
-    items_ref = get_db_reference(
+    ref = get_db_reference(
         f"sessions/{session_id}/cart/items"
     )
 
-    def apply_add(current_items):
-        updated = dict(current_items or {})
+    def add_items_transaction(current):
+        updated = dict(current or {})
         updated.update(additions)
         return updated
 
-    items_ref.transaction(apply_add)
+    ref.transaction(add_items_transaction)
 
     return get_session_cart(
         session_id,
@@ -511,7 +550,14 @@ def process_order_message(
     session_token: str,
     text: str,
 ) -> dict:
-    """고객 메시지를 분석하여 장바구니에 반영한다."""
+    """음성·버튼 메시지를 하나의 주문 흐름으로 처리."""
+
+    if (
+        not isinstance(text, str)
+        or not text.strip()
+        or len(text) > 1000
+    ):
+        raise ValueError("MESSAGE_TEXT_INVALID")
 
     session = _get_authenticated_session(
         session_id,
@@ -519,13 +565,49 @@ def process_order_message(
     )
 
     store_id = session["storeId"]
+    normalized = _normalize(text)
+
+    # 1. 담기 완료 후 네/아니요
+    if get_dialog_state(session_id) == "awaiting_more":
+
+        if normalized in YES_ANSWERS:
+            set_dialog_state(session_id, None)
+
+            return {
+                "intent": "answer",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": "더 드실 메뉴를 말씀해 주세요.",
+                "cart": None,
+                "nextAction": "continue_order",
+            }
+
+        if normalized in NO_ANSWERS:
+            set_dialog_state(session_id, None)
+
+            return {
+                "intent": "answer",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": None,
+                "cart": get_session_cart(
+                    session_id,
+                    session_token,
+                ),
+                "nextAction": "review_cart",
+            }
+
+        # 추가 주문 여부 질문에 메뉴를 바로 말해도 허용
+        # 성공적으로 다음 분석이 끝나기 전까지
+        # 기존 상태는 그대로 둔다.
+
+    # 2. 미완성 주문의 후속 답변
     pending = get_pending_order(session_id)
 
     if pending:
-        analysis = resolve_followup(
-            pending,
-            text,
-        )
+        analysis = resolve_followup(pending, text)
 
         if analysis is None:
             return {
@@ -538,14 +620,15 @@ def process_order_message(
                     or "다시 말씀해 주세요."
                 ),
                 "cart": None,
+                "nextAction": "clarification",
             }
-
     else:
         analysis = analyze_order_text(
             store_id=store_id,
             text=text,
         )
 
+    # 3. 메뉴·옵션·수량 검증
     result = validate_order_analysis(
         store_id,
         analysis,
@@ -556,20 +639,22 @@ def process_order_message(
     )
 
     result["cart"] = None
+    result["nextAction"] = None
 
-    # 변경·삭제·확인 의도는 아직 자동 처리하지 않는다.
     if result["intent"] != "add_item":
         return result
 
     if result["needsClarification"]:
+        set_dialog_state(session_id, None)
         save_pending_order(
             session_id,
             result,
         )
 
+        result["nextAction"] = "clarification"
         return result
 
-    # 검증된 메뉴를 기존 장바구니에 반영
+    # 4. 주문 정보 완성 → 장바구니 추가
     result["cart"] = add_analyzed_items(
         session_id,
         session_token,
@@ -577,5 +662,14 @@ def process_order_message(
     )
 
     clear_pending_order(session_id)
+
+    # 5. 담기 완료 카드 후 네/아니요 대기
+    set_dialog_state(
+        session_id,
+        "awaiting_more",
+    )
+
+    result["question"] = "더 필요한 게 있나요?"
+    result["nextAction"] = "ask_more"
 
     return result
