@@ -549,6 +549,7 @@ def add_analyzed_items(
     )
 
 
+
 def process_order_message(
     session_id: str,
     session_token: str,
@@ -570,10 +571,11 @@ def process_order_message(
 
     store_id = session["storeId"]
     normalized = _normalize(text)
-    
 
-    # 전체 비우기 확인 대화
-    if get_dialog_state(session_id) == "confirm_clear":
+    dialog_state = get_dialog_state(session_id)
+
+    # 1. 장바구니 전체 비우기 확인
+    if dialog_state == "confirm_clear":
         if normalized in YES_ANSWERS:
             result = confirm_voice_clear(
                 session_id, session_token, True
@@ -593,18 +595,18 @@ def process_order_message(
             "items": [],
             "issues": [],
             "needsClarification": True,
-            "question": "장바구니를 모두 비울까요? 네 또는 아니요로 답해 주세요.",
+            "question": (
+                "장바구니를 모두 비울까요? "
+                "네 또는 아니요로 답해 주세요."
+            ),
             "cart": None,
             "nextAction": "confirm_clear",
         }
-    
 
-    # 1. 담기 완료 후 네/아니요
-    if get_dialog_state(session_id) == "awaiting_more":
-
+    # 2. 담기 완료 후 추가 주문 여부
+    if dialog_state == "awaiting_more":
         if normalized in YES_ANSWERS:
             set_dialog_state(session_id, None)
-
             return {
                 "intent": "answer",
                 "items": [],
@@ -617,7 +619,6 @@ def process_order_message(
 
         if normalized in NO_ANSWERS:
             set_dialog_state(session_id, None)
-
             return {
                 "intent": "answer",
                 "items": [],
@@ -631,11 +632,7 @@ def process_order_message(
                 "nextAction": "review_cart",
             }
 
-        # 추가 주문 여부 질문에 메뉴를 바로 말해도 허용
-        # 성공적으로 다음 분석이 끝나기 전까지
-        # 기존 상태는 그대로 둔다.
-
-    # 2. 미완성 주문의 후속 답변
+    # 3. 미완성 주문 후속 답변
     pending = get_pending_order(session_id)
 
     if pending:
@@ -660,23 +657,8 @@ def process_order_message(
             text=text,
         )
 
-    # 3. 메뉴·옵션·수량 검증
-    result = validate_order_analysis(
-        store_id,
-        analysis,
-    )
-
-    result["question"] = (
-        generate_clarification_question(result)
-    )
-
-    result["cart"] = None
-    result["nextAction"] = None
-
-    if result["intent"] != "add_item":
-        return result
-
-    if result["intent"] in (
+    # 4. 변경·삭제·전체 비우기 명령
+    if analysis.intent in (
         "update_item",
         "remove_item",
         "clear_cart",
@@ -694,11 +676,33 @@ def process_order_message(
 
         return action_result
 
+    # 5. 메뉴·옵션·수량 검증
+    result = validate_order_analysis(
+        store_id,
+        analysis,
+    )
+
+    result["question"] = generate_clarification_question(
+        result
+    )
+    result["cart"] = None
+    result["nextAction"] = None
+
+    # 주문 추가 외 의도
     if result["intent"] != "add_item":
         return result
 
+    # 6. 미완성 주문이면 질문하고 대기
+    if result["needsClarification"]:
+        save_pending_order(
+            session_id,
+            result,
+        )
 
-    # 4. 주문 정보 완성 → 장바구니 추가
+        result["nextAction"] = "clarification"
+        return result
+
+    # 7. 모든 정보가 완성된 경우에만 장바구니 추가
     result["cart"] = add_analyzed_items(
         session_id,
         session_token,
@@ -707,7 +711,7 @@ def process_order_message(
 
     clear_pending_order(session_id)
 
-    # 5. 담기 완료 카드 후 네/아니요 대기
+    # 8. 담기 완료 후 추가 주문 여부 대기
     set_dialog_state(
         session_id,
         "awaiting_more",

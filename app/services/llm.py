@@ -1,16 +1,16 @@
 
-"""Gemini를 이용한 주문 문장 분석."""
+"""카페 주문 문장 분석: 규칙 기반 우선, Gemini 보조."""
 
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai._gaos.lib.compat_errors import (
-    APIError,
-    APITimeoutError,
-)
+from google.genai import types
+from google.genai.errors import APIError
 from pydantic import ValidationError
 
 from app.repositories.store_repository import (
@@ -38,19 +38,16 @@ SYSTEM_INSTRUCTION = """
 - 한 주문 항목의 메뉴명, 수량, 크기, 온도, 얼음을
   반드시 하나의 item에 함께 기록한다.
 - 메뉴명 앞뒤에 붙은 옵션 표현도 해당 항목에 연결한다.
-- '큰 사이즈', '따뜻하게', '얼음 적게' 같은 옵션 표현만으로
-  새로운 item을 만들지 않는다.
+- 옵션 표현만으로 새로운 item을 만들지 않는다.
 - 서로 다른 메뉴를 주문하면 항목을 분리한다.
-- 같은 메뉴라도 서로 다른 옵션으로 각각 주문했다면 항목을 분리한다.
-- 메뉴명이 같다는 이유만으로 서로 다른 주문 항목을 합치지 않는다.
+- 같은 메뉴라도 서로 다른 옵션이면 항목을 분리한다.
 
 [수량]
 - '하나', '한 잔', '한 개'는 1이다.
 - '둘', '두 잔', '두 개'는 2다.
-- 고객이 수량을 말하지 않았으면 quantity는 null이다.
-- 음성 인식 오류로 수량 단위가 잘못 변환된 경우, 문맥상 명확하면 자연스럽게 해석한다.
-- 예: '아메리카노 두 장'은 '아메리카노 두 잔'으로 해석하여 quantity=2로 반환한다.
-- 수량 자체가 불명확하거나 여러 의미로 해석될 수 있으면 임의로 추측하지 않고 null로 둔다.
+- 수량을 말하지 않았으면 quantity는 null이다.
+- 문맥상 명확한 수량 단위 인식 오류는 자연스럽게 해석한다.
+- 수량이 불명확하면 임의로 추측하지 않는다.
 
 [옵션]
 - '따뜻한', '따뜻하게', '뜨거운', '핫'은 temperature=hot이다.
@@ -61,54 +58,46 @@ SYSTEM_INSTRUCTION = """
 - '얼음 보통'은 ice=regular다.
 - '얼음 적게'는 ice=less다.
 - 크기의 '보통'과 얼음의 '보통'을 혼동하지 않는다.
-- 고객이 말하지 않았거나 불명확한 옵션만 null로 둔다.
-- 명확하게 말한 옵션은 반드시 해당 필드에 기록한다.
-- 고객이 말하지 않은 기본 옵션을 임의로 채우지 않는다.
-- 옵션이 매장에서 허용되는지는 서버가 별도로 검증한다.
-- 옵션 표현을 이해했다면 매장 설정에 없다는 이유로 숨기거나
-  다른 값으로 바꾸지 않는다.
-- 서로 모순되는 표현은 임의로 선택하지 않는다.
-  단, '아니', '말고' 등 명확한 정정 표현이 있으면 정정한 값을 따른다.
+- 고객이 명시하지 않은 옵션은 null이다.
+- 허용 옵션의 최종 검증은 서버가 별도로 한다.
+- 모순된 표현은 임의로 선택하지 않는다.
+- 명확한 정정 표현이 있으면 정정한 값을 따른다.
 
 [의도]
-- 메뉴 추가 요청: add_item
-- 기존 메뉴의 수량이나 옵션 변경: update_item
+- 메뉴 추가: add_item
+- 기존 메뉴 수량·옵션 변경: update_item
 - 기존 메뉴 삭제: remove_item
-- 장바구니 전체 비우기: clear_cart
-- '이제 됐어요', '주문 끝났어요': review_order
-- review_order는 주문 확인 요청이며 실제 주문 확정이 아니다.
-- '네', '아니요', '큰 걸로요' 같은 후속 답변: answer
-- 메뉴 추천 요청: recommend
-- 메뉴 목록 질문: browse_menu
-- 직원 호출 요청: request_help
+- 장바구니 비우기: clear_cart
+- 주문 확인 요청: review_order
+- 후속 답변: answer
+- 메뉴 추천: recommend
+- 메뉴 조회: browse_menu
+- 직원 호출: request_help
 - 판단할 수 없는 의도: unknown
-- 메뉴 항목을 추출할 필요가 없으면 items는 빈 목록이다.
-- 가격 계산, 장바구니 저장, 주문 접수는 하지 않는다.
+- 항목이 불필요하면 items는 빈 목록이다.
+- 주문 확인과 실제 주문 확정은 다르다.
+- 가격 계산이나 DB 저장은 하지 않는다.
 
-[응답 전 확인]
-- 각 주문 항목을 원문과 비교하여 수량과 옵션이 빠졌는지 확인한다.
-- 옵션 표현만으로 불필요한 항목을 만들지 않았는지 확인한다.
-- 명시된 옵션을 null로 반환하지 않았는지 확인한다.
-- 아래 예시는 처리 방식의 예시다.
-  실제 menu_id는 반드시 전달받은 메뉴 목록을 기준으로 선택한다.
+[검증]
+- 명시된 수량과 옵션을 누락하지 않는다.
+- 메뉴와 옵션은 같은 주문 항목에 연결한다.
+- 실제 menu_id는 전달받은 목록에서만 선택한다.
 
 예시 1:
 입력: 아아 하나, 얼음 적게
 결과:
 {
   "intent": "add_item",
-  "items": [
-    {
-      "menu_text": "아아",
-      "menu_id": "americano",
-      "quantity": 1,
-      "options": {
-        "size": null,
-        "temperature": "ice",
-        "ice": "less"
-      }
+  "items": [{
+    "menu_text": "아아",
+    "menu_id": "americano",
+    "quantity": 1,
+    "options": {
+      "size": null,
+      "temperature": "ice",
+      "ice": "less"
     }
-  ]
+  }]
 }
 
 예시 2:
@@ -170,9 +159,399 @@ SYSTEM_INSTRUCTION = """
 }
 """
 
+# 이 표현이 있으면 단순한 추가 주문으로 판단하지 않는다.
+COMPLEX_WORDS = re.compile(
+    r"말고|대신|바꿔|변경|수정|취소|삭제|빼줘|빼주세요|"
+    r"비워|전부|전체|추천|메뉴판|뭐가|뭐있|"
+    r"직원|도와|도움|아까|그거|그걸|아니"
+)
 
-def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
-    """매장 메뉴를 바탕으로 주문 문장을 분석하고 형식을 검증한다."""
+# 판매 메뉴의 명칭과 정확하게 대응하는 별칭만 등록한다.
+MENU_ALIASES = {
+    "아아": ("americano", "ice"),
+}
+
+SIZE_PATTERNS = {
+    "large": r"큰\s*사이즈|큰\s*크기|라지|큰\s*걸로",
+    "regular": r"보통\s*사이즈|보통\s*크기|레귤러",
+}
+
+TEMPERATURE_PATTERNS = {
+    "hot": r"따뜻한|따뜻하게|뜨거운|핫",
+    "ice": r"아이스|차가운|차갑게",
+}
+
+ICE_PATTERNS = {
+    "less": r"얼음\s*(?:적게|조금)",
+    "regular": r"얼음\s*보통",
+    "more": r"얼음\s*많이",
+}
+
+QUANTITY_PATTERN = re.compile(
+    r"(?<![가-힣A-Za-z0-9])"
+    r"(한|하나|두|둘|세|셋|네|넷|[1-9][0-9]*)"
+    r"\s*(잔|개|장)?"
+    r"(?![가-힣A-Za-z0-9])"
+)
+
+QUANTITY_WORDS = {
+    "한": 1,
+    "하나": 1,
+    "두": 2,
+    "둘": 2,
+    "세": 3,
+    "셋": 3,
+    "네": 4,
+    "넷": 4,
+}
+
+# 명확한 주문 문장에서 무시 가능한 일반적인 표현
+FILLER_PATTERN = re.compile(
+    r"주세요|주세용|줘요|줘|부탁해요|부탁드려요|"
+    r"주문할게요|주문이요|할게요|이요|요|"
+    r"도|좀|으로|로"
+)
+
+
+def _extract_one(patterns: dict, text: str):
+    """한 필드에 단일 값만 명확하게 있는 경우 추출한다."""
+
+    matched = []
+
+    for value, pattern in patterns.items():
+        if re.search(pattern, text):
+            matched.append(value)
+
+    if len(matched) > 1:
+        return None, True
+
+    return (matched[0] if matched else None), False
+
+
+def _remove_patterns(text: str, patterns: dict) -> str:
+    for pattern in patterns.values():
+        text = re.sub(pattern, " ", text)
+    return text
+
+
+def _rule_based_cart_command(
+    text: str,
+    menus: dict,
+) -> OrderAnalysis | None:
+    """명확한 장바구니 수정·삭제 명령을 Gemini 없이 분석한다."""
+
+    original = text.strip()
+    normalized = re.sub(r"\s+", "", original)
+
+    # 전체 비우기
+    if (
+        re.search(r"장바구니|전체|전부|모두", normalized)
+        and re.search(r"비워|비우|전체삭제|전부삭제", normalized)
+    ):
+        return OrderAnalysis.model_validate({
+            "intent": "clear_cart",
+            "items": [],
+        })
+
+    # 변경/삭제 의도 구분
+    remove = bool(re.search(
+        r"삭제|지워|지워줘|빼줘|빼주세요",
+        normalized,
+    ))
+    update = bool(re.search(
+        r"변경|바꿔|수정",
+        normalized,
+    ))
+
+    # 서로 충돌하거나 의도가 불명확하면 Gemini로 전달
+    if remove == update:
+        return None
+
+    intent = "remove_item" if remove else "update_item"
+
+    # 메뉴가 정확히 하나만 언급된 경우 처리
+    matched = [
+        (menu_id, menu["name"])
+        for menu_id, menu in menus.items()
+        if isinstance(menu, dict)
+        and isinstance(menu.get("name"), str)
+        and menu["name"] in original
+    ]
+
+    if len(matched) != 1:
+        return None
+
+    menu_id, menu_name = matched[0]
+
+    quantity = None
+
+    # 수정 명령의 수량 추출
+    if intent == "update_item":
+        quantity_match = re.search(
+            r"(한|하나|두|둘|세|셋|네|넷|[1-9][0-9]*)"
+            r"\s*(?:잔|개|장)",
+            original,
+        )
+
+        if quantity_match:
+            raw = quantity_match.group(1)
+            quantity = QUANTITY_WORDS.get(raw)
+
+            if quantity is None:
+                quantity = int(raw)
+
+        # 수량 변경 외 복잡한 수정 명령은 Gemini에 맡긴다.
+        if quantity is None:
+            return None
+
+    # 예상하지 못한 문구가 섞이면 규칙 기반으로 단정하지 않음
+    remaining = original.replace(menu_name, "", 1)
+    remaining = re.sub(
+        r"(한|하나|두|둘|세|셋|네|넷|[1-9][0-9]*)"
+        r"\s*(?:잔|개|장)",
+        " ",
+        remaining,
+    )
+    remaining = re.sub(
+        r"삭제해줘|삭제해주세요|삭제|"
+        r"지워줘|지워주세요|지워|"
+        r"빼줘|빼주세요|"
+        r"변경해줘|변경해주세요|변경|"
+        r"바꿔줘|바꿔주세요|바꿔|"
+        r"수정해줘|수정해주세요|수정|"
+        r"주세요|줘요|줘|해줘|해요|해|"
+        r"으로|로|요|좀",
+        " ",
+        remaining,
+    )
+
+    if remaining.strip():
+        return None
+
+    return OrderAnalysis.model_validate({
+        "intent": intent,
+        "items": [{
+            "menu_text": menu_name,
+            "menu_id": menu_id,
+            "quantity": quantity,
+            "options": {
+                "size": None,
+                "temperature": None,
+                "ice": None,
+            },
+        }],
+    })
+
+
+def _rule_based_analysis(
+    text: str,
+    menus: dict,
+) -> OrderAnalysis | None:
+    """확실하게 해석 가능한 단일 메뉴 추가 주문만 분석한다.
+
+    해석할 수 없는 문장은 추측하지 않고 Gemini로 넘긴다.
+    """
+
+    original = text.strip()
+    normalized = re.sub(r"[,.!?]", " ", original).strip()
+
+    if COMPLEX_WORDS.search(normalized):
+        return None
+
+    matches = []
+
+    # 실제 메뉴명 검색
+    for menu_id, menu in menus.items():
+        if not isinstance(menu, dict):
+            continue
+
+        name = menu.get("name")
+
+        if not isinstance(name, str) or not name:
+            continue
+
+        if name in normalized:
+            matches.append((menu_id, name, None))
+
+    # 별칭 검색
+    for alias, (menu_id, implied_temperature) in MENU_ALIASES.items():
+        if (
+            menu_id in menus
+            and re.search(
+                rf"(?<![가-힣]){re.escape(alias)}(?![가-힣])",
+                normalized,
+            )
+        ):
+            matches.append(
+                (menu_id, alias, implied_temperature)
+            )
+
+    # 단일 메뉴인 경우만 규칙 기반 처리
+    if len(matches) != 1:
+        return None
+
+    menu_id, menu_text, implied_temp = matches[0]
+
+    size, size_conflict = _extract_one(
+        SIZE_PATTERNS, normalized
+    )
+    temp, temp_conflict = _extract_one(
+        TEMPERATURE_PATTERNS, normalized
+    )
+    ice, ice_conflict = _extract_one(
+        ICE_PATTERNS, normalized
+    )
+
+    if size_conflict or temp_conflict or ice_conflict:
+        return None
+
+    if implied_temp is not None:
+        if temp is not None and temp != implied_temp:
+            return None
+        temp = implied_temp
+
+    # "보통"만 있으면 크기인지 얼음인지 모호하다.
+    remaining = normalized.replace(menu_text, " ", 1)
+    remaining = _remove_patterns(
+        remaining, SIZE_PATTERNS
+    )
+    remaining = _remove_patterns(
+        remaining, TEMPERATURE_PATTERNS
+    )
+    remaining = _remove_patterns(
+        remaining, ICE_PATTERNS
+    )
+
+    # 수량 추출
+    quantity_matches = list(
+        QUANTITY_PATTERN.finditer(remaining)
+    )
+
+    if len(quantity_matches) > 1:
+        return None
+
+    quantity = None
+
+    if quantity_matches:
+        match = quantity_matches[0]
+        raw_number = match.group(1)
+
+        quantity = QUANTITY_WORDS.get(raw_number)
+
+        if quantity is None:
+            quantity = int(raw_number)
+
+        remaining = (
+            remaining[:match.start()]
+            + " "
+            + remaining[match.end():]
+        )
+
+    remaining = FILLER_PATTERN.sub(" ", remaining)
+    remaining = re.sub(r"\s+", "", remaining)
+
+    # 알려지지 않은 표현은 함부로 무시하지 않는다.
+    if remaining:
+        return None
+
+    # 모순된 옵션도 추측해서 처리하지 않는다.
+    if temp == "hot" and ice is not None:
+        return None
+
+    return OrderAnalysis.model_validate({
+        "intent": "add_item",
+        "items": [{
+            "menu_text": menu_text,
+            "menu_id": menu_id,
+            "quantity": quantity,
+            "options": {
+                "size": size,
+                "temperature": temp,
+                "ice": ice,
+            },
+        }],
+    })
+
+
+def _gemini_analysis(
+    model_name: str,
+    api_key: str,
+    payload: dict,
+) -> OrderAnalysis:
+    """복잡한 주문만 Gemini로 분석한다."""
+
+    print("4. Gemini 분석 요청 시작", flush=True)
+    started = time.monotonic()
+
+    try:
+        with genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=15000,
+                retry_options=types.HttpRetryOptions(
+                    attempts=1,
+                ),
+            ),
+        ) as client:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                ),
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    response_mime_type="application/json",
+                    response_schema=OrderAnalysis,
+                    max_output_tokens=2048,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="low",
+                    ),
+                ),
+            )
+
+        output_text = response.text
+
+    except APIError as exc:
+        print(
+            f"Gemini API error: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        code = getattr(exc, "code", None)
+
+        if code in (408, 504):
+            raise ValueError("LLM_TIMEOUT") from exc
+
+        raise ValueError("LLM_API_ERROR") from exc
+
+    except (TimeoutError, OSError) as exc:
+        raise ValueError("LLM_TIMEOUT") from exc
+
+    finally:
+        print(
+            "Gemini elapsed:",
+            round(time.monotonic() - started, 2),
+            "seconds",
+            flush=True,
+        )
+
+    if not output_text or not output_text.strip():
+        raise ValueError("LLM_EMPTY_RESPONSE")
+
+    try:
+        return OrderAnalysis.model_validate_json(
+            output_text
+        )
+    except (ValidationError, ValueError) as exc:
+        raise ValueError("LLM_INVALID_RESPONSE") from exc
+
+
+def analyze_order_text(
+    store_id: str,
+    text: str,
+) -> OrderAnalysis:
+    """단순 주문은 즉시 분석, 복잡한 주문은 Gemini로 분석."""
 
     if (
         not isinstance(text, str)
@@ -182,15 +561,6 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
         raise ValueError("MESSAGE_TEXT_INVALID")
 
     load_dotenv(BASE_DIR / ".env")
-
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model_name = os.getenv("GEMINI_MODEL", "").strip()
-
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY_MISSING")
-
-    if not model_name:
-        raise ValueError("GEMINI_MODEL_MISSING")
 
     print("1. Firebase 매장 및 메뉴 조회 시작", flush=True)
 
@@ -205,6 +575,43 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
         raise ValueError("MENU_NOT_FOUND")
 
     print("2. Firebase 매장 및 메뉴 조회 완료", flush=True)
+
+
+    # 1차: 명확한 장바구니 명령
+    result = _rule_based_cart_command(text, menus)
+
+    if result is not None:
+        print(
+            "3. 규칙 기반 장바구니 명령 분석 완료",
+            flush=True,
+        )
+        return result
+
+    # 2차: 일반 메뉴 추가 주문
+    result = _rule_based_analysis(text, menus)
+
+
+    if result is not None:
+        print(
+            "3. 규칙 기반 주문 분석 완료 (Gemini 호출 없음)",
+            flush=True,
+        )
+        return result
+
+    # 2차: Gemini 분석
+    print(
+        "3. 복잡한 문장 - Gemini 분석 사용",
+        flush=True,
+    )
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    model_name = os.getenv("GEMINI_MODEL", "").strip()
+
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY_MISSING")
+
+    if not model_name:
+        raise ValueError("GEMINI_MODEL_MISSING")
 
     catalog = [
         {
@@ -224,56 +631,16 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
         for menu_id, menu in menus.items()
     ]
 
-    payload = {
-        "menus": catalog,
-        "customerText": text.strip(),
-    }
+    result = _gemini_analysis(
+        model_name=model_name,
+        api_key=api_key,
+        payload={
+            "menus": catalog,
+            "customerText": text.strip(),
+        },
+    )
 
-    print("3. Gemini 연결 준비", flush=True)
-    print(f"사용 모델: {model_name}", flush=True)
-
-    try:
-        with genai.Client(api_key=api_key) as client:
-            print("4. Gemini 분석 요청 시작", flush=True)
-
-            interaction = client.interactions.create(
-                model=model_name,
-                input=json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                ),
-                system_instruction=SYSTEM_INSTRUCTION,
-                response_format={
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": OrderAnalysis.model_json_schema(),
-                },
-                generation_config={
-                    "max_output_tokens": 4096,
-                    "thinking_level": "medium",
-                },
-                timeout=30.0,
-            )
-
-            print("5. Gemini 응답 수신 완료", flush=True)
-
-            output_text = interaction.output_text
-
-    except APITimeoutError as exc:
-        raise ValueError("LLM_TIMEOUT") from exc
-
-    except APIError as exc:
-        raise ValueError("LLM_API_ERROR") from exc
-
-    if not output_text or not output_text.strip():
-        raise ValueError("LLM_EMPTY_RESPONSE")
-
-    try:
-        result = OrderAnalysis.model_validate_json(output_text)
-
-    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("LLM_INVALID_RESPONSE") from exc
-
+    # 모델이 잘못된 메뉴 ID를 반환하면 사용하지 않는다.
     for item in result.items:
         if (
             item.menu_id is not None
@@ -281,6 +648,6 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
         ):
             item.menu_id = None
 
-    print("6. 분석 결과 형식 검증 완료", flush=True)
+    print("5. 분석 결과 검증 완료", flush=True)
 
     return result
