@@ -9,7 +9,10 @@ from google import genai
 from google.genai._gaos.lib.compat_errors import APITimeoutError
 from pydantic import ValidationError
 
-from app.repositories.store_repository import get_store_menus
+from app.repositories.store_repository import (
+    get_store,
+    get_store_menus,
+)
 from app.schemas.messages import OrderAnalysis
 
 
@@ -185,11 +188,23 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
     if not model_name:
         raise ValueError("GEMINI_MODEL_MISSING")
 
-    print("1. Firebase 메뉴 조회 시작", flush=True)
+    
+    print("1. Firebase 매장 및 메뉴 조회 시작", flush=True)
 
+    # 매장이 실제로 존재하는지 확인
+    store = get_store(store_id)
+
+    if store is None:
+        raise ValueError("STORE_NOT_FOUND")
+
+    # 해당 매장의 메뉴 조회
     menus = get_store_menus(store_id)
 
-    print("2. Firebase 메뉴 조회 완료", flush=True)
+    if not menus:
+        raise ValueError("MENU_NOT_FOUND")
+
+    print("2. Firebase 매장 및 메뉴 조회 완료", flush=True)
+
 
     if not menus:
         raise ValueError("MENU_NOT_FOUND")
@@ -199,7 +214,7 @@ def analyze_order_text(store_id: str, text: str) -> OrderAnalysis:
         {
             "menuId": menu_id,
             "name": menu["name"],
-            "isAvailable": menu.get("isAvailable", False),
+            "isAvailable": menu.get("isAvailable", True),
             "sizes": list(
                 (menu.get("sizeOptions") or {}).keys()
             ),
