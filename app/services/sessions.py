@@ -7,19 +7,23 @@ from uuid import uuid4
 
 from app.core.firebase import get_db_reference
 
+SESSION_TTL_MS = 30 * 60 * 1000
+
 
 def _get_authenticated_session(
     session_id: str,
     session_token: str,
 ) -> dict:
-    """토큰과 세션 상태를 확인한다."""
+    """토큰, 세션 상태, 만료 시각을 확인한다."""
 
     if not session_token:
         raise ValueError("SESSION_UNAUTHORIZED")
 
-    session = get_db_reference(f"sessions/{session_id}").get()
+    session = get_db_reference(
+        f"sessions/{session_id}"
+    ).get()
 
-    if session is None:
+    if not isinstance(session, dict):
         raise ValueError("SESSION_UNAUTHORIZED")
 
     token_hash = hashlib.sha256(
@@ -33,6 +37,21 @@ def _get_authenticated_session(
         raise ValueError("SESSION_UNAUTHORIZED")
 
     if session.get("status") != "active":
+        raise ValueError("SESSION_INACTIVE")
+
+    now_ms = time.time_ns() // 1_000_000
+    expires_at = session.get("expiresAt")
+
+    # 기존 세션 호환성
+    if expires_at is None:
+        created_at = session.get("createdAt")
+        if type(created_at) is int:
+            expires_at = created_at + SESSION_TTL_MS
+
+    if type(expires_at) is not int:
+        raise ValueError("SESSION_INACTIVE")
+
+    if now_ms >= expires_at:
         raise ValueError("SESSION_INACTIVE")
 
     return session
@@ -88,9 +107,11 @@ def _calculate_unit_price(menu: dict, options: dict) -> int:
 
 
 def create_session(store_id: str) -> dict:
-    """매장을 확인하고 주문 세션을 생성한다."""
+    """매장을 확인하고 만료 시각이 있는 세션을 생성한다."""
 
-    store = get_db_reference(f"stores/{store_id}").get()
+    store = get_db_reference(
+        f"stores/{store_id}"
+    ).get()
 
     if store is None:
         raise ValueError("STORE_NOT_FOUND")
@@ -100,14 +121,20 @@ def create_session(store_id: str) -> dict:
 
     session_id = uuid4().hex
     session_token = secrets.token_urlsafe(32)
+
     token_hash = hashlib.sha256(
         session_token.encode("utf-8")
     ).hexdigest()
 
-    get_db_reference(f"sessions/{session_id}").set({
+    now_ms = time.time_ns() // 1_000_000
+
+    get_db_reference(
+        f"sessions/{session_id}"
+    ).set({
         "storeId": store_id,
         "status": "active",
-        "createdAt": time.time_ns() // 1_000_000,
+        "createdAt": now_ms,
+        "expiresAt": now_ms + SESSION_TTL_MS,
         "tokenHash": token_hash,
     })
 
@@ -310,3 +337,44 @@ def clear_cart(
     ).delete()
 
     return get_session_cart(session_id, session_token)
+
+
+
+def end_session(
+    session_id: str,
+    session_token: str,
+) -> dict:
+    """고객의 주문 세션을 종료한다."""
+
+    # 인증 오류는 트랜잭션 시작 전에 처리
+    _get_authenticated_session(
+        session_id,
+        session_token,
+    )
+
+    session_ref = get_db_reference(
+        f"sessions/{session_id}"
+    )
+
+    now_ms = time.time_ns() // 1_000_000
+
+    def close_transaction(current):
+        if not isinstance(current, dict):
+            raise ValueError("SESSION_UNAUTHORIZED")
+
+        if current.get("status") != "active":
+            raise ValueError("SESSION_INACTIVE")
+
+        updated = current.copy()
+        updated["status"] = "ended"
+        updated["endedAt"] = now_ms
+
+        return updated
+
+    session_ref.transaction(close_transaction)
+
+    return {
+        "sessionId": session_id,
+        "status": "ended",
+        "endedAt": now_ms,
+    }
