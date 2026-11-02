@@ -14,6 +14,10 @@ from app.services.sessions import (
     _validate_quantity,
     get_session_cart,
 )
+from app.services.voice_cart import (
+    process_voice_cart_command,
+    confirm_voice_clear,
+)
 
 
 OPTION_FIELDS = ("size", "temperature", "ice")
@@ -566,6 +570,34 @@ def process_order_message(
 
     store_id = session["storeId"]
     normalized = _normalize(text)
+    
+
+    # 전체 비우기 확인 대화
+    if get_dialog_state(session_id) == "confirm_clear":
+        if normalized in YES_ANSWERS:
+            result = confirm_voice_clear(
+                session_id, session_token, True
+            )
+            set_dialog_state(session_id, None)
+            return result
+
+        if normalized in NO_ANSWERS:
+            result = confirm_voice_clear(
+                session_id, session_token, False
+            )
+            set_dialog_state(session_id, None)
+            return result
+
+        return {
+            "intent": "answer",
+            "items": [],
+            "issues": [],
+            "needsClarification": True,
+            "question": "장바구니를 모두 비울까요? 네 또는 아니요로 답해 주세요.",
+            "cart": None,
+            "nextAction": "confirm_clear",
+        }
+    
 
     # 1. 담기 완료 후 네/아니요
     if get_dialog_state(session_id) == "awaiting_more":
@@ -644,15 +676,27 @@ def process_order_message(
     if result["intent"] != "add_item":
         return result
 
-    if result["needsClarification"]:
-        set_dialog_state(session_id, None)
-        save_pending_order(
+    if result["intent"] in (
+        "update_item",
+        "remove_item",
+        "clear_cart",
+    ):
+        action_result = process_voice_cart_command(
             session_id,
-            result,
+            session_token,
+            analysis,
         )
 
-        result["nextAction"] = "clarification"
+        if action_result["nextAction"] == "confirm_clear":
+            set_dialog_state(session_id, "confirm_clear")
+        else:
+            set_dialog_state(session_id, None)
+
+        return action_result
+
+    if result["intent"] != "add_item":
         return result
+
 
     # 4. 주문 정보 완성 → 장바구니 추가
     result["cart"] = add_analyzed_items(
