@@ -338,3 +338,128 @@ def get_order(
     )
 
     return order
+
+def update_order_status(
+    order_id: str,
+    new_status: str,
+) -> dict:
+    """주문 상태를 다음 단계로 변경한다."""
+
+    # 허용되는 상태 전이
+    allowed_transitions = {
+        "pending": "preparing",
+        "preparing": "completed",
+    }
+
+    if new_status not in ("preparing", "completed"):
+        raise ValueError("ORDER_STATUS_INVALID")
+
+    session_ref = get_db_reference(
+        f"sessions/{order_id}"
+    )
+
+    def update_transaction(current):
+        """주문 상태를 트랜잭션으로 변경한다."""
+
+        if current is None:
+            raise ValueError("ORDER_NOT_FOUND")
+
+        if current.get("status") != "ordered":
+            raise ValueError("ORDER_NOT_FOUND")
+
+        order = current.get("order")
+
+        if not isinstance(order, dict):
+            raise ValueError("ORDER_NOT_FOUND")
+
+        current_status = order.get("status")
+
+        # 이미 같은 상태라면 그대로 반환
+        if current_status == new_status:
+            return current
+
+        # 다음 단계로만 변경 허용
+        if allowed_transitions.get(current_status) != new_status:
+            raise ValueError("ORDER_STATUS_INVALID")
+
+        updated = dict(current)
+        updated_order = dict(order)
+
+        updated_order["status"] = new_status
+        updated_order["imageId"] = get_status_image(
+            new_status
+        )
+
+        updated["order"] = updated_order
+
+        return updated
+
+    # Firebase 트랜잭션 실행
+    session_ref.transaction(update_transaction)
+
+    # 변경된 주문 다시 조회
+    saved_session = session_ref.get()
+
+    if saved_session is None:
+        raise ValueError("ORDER_NOT_FOUND")
+
+    if saved_session.get("status") != "ordered":
+        raise ValueError("ORDER_NOT_FOUND")
+
+    saved_order = saved_session.get("order")
+
+    if not isinstance(saved_order, dict):
+        raise ValueError("ORDER_NOT_FOUND")
+
+    if saved_order.get("status") != new_status:
+        raise ValueError("ORDER_STATUS_INVALID")
+
+    return {
+        "orderId": order_id,
+        "status": saved_order["status"],
+        "imageId": get_status_image(
+            saved_order["status"]
+        ),
+    }
+def get_orders(store_id: str) -> list[dict]:
+    """매장의 전체 주문 목록을 최신순으로 조회한다."""
+
+    if not store_id:
+        raise ValueError("STORE_ID_INVALID")
+
+    sessions = get_db_reference("sessions").get()
+
+    if not isinstance(sessions, dict):
+        return []
+
+    orders = []
+
+    for session_id, session in sessions.items():
+        if not isinstance(session, dict):
+            continue
+
+        if session.get("status") != "ordered":
+            continue
+
+        if session.get("storeId") != store_id:
+            continue
+
+        order = session.get("order")
+
+        if not isinstance(order, dict):
+            continue
+
+        order_data = dict(order)
+        order_data["orderId"] = session_id
+        order_data["imageId"] = get_status_image(
+            order_data["status"]
+        )
+
+        orders.append(order_data)
+
+    orders.sort(
+        key=lambda order: order.get("createdAt", 0),
+        reverse=True,
+    )
+
+    return orders

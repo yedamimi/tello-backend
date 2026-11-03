@@ -1,7 +1,7 @@
 
 """주문 확정·조회 API."""
 
-from fastapi import APIRouter, Depends, Header, Path
+from fastapi import APIRouter, Depends, Header, Path, Query
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -9,13 +9,24 @@ from app.schemas.orders import (
     OrderCreateRequest,
     OrderCreateResponse,
     OrderReadResponse,
+    OrderStatusUpdateRequest,
+    OrderStatusUpdateResponse,
+    OrderListResponse,
 )
-from app.services.orders import create_order, get_order
-
+from app.services.orders import (
+    create_order,
+    get_order,
+    update_order_status,
+    get_orders,
+)
 
 router = APIRouter(
     prefix="/orders",
     tags=["orders"],
+)
+admin_router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
 )
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -161,3 +172,65 @@ def read_order(
                 else None
             ),
         )
+
+@router.patch(
+    "/{orderId}/status",
+    response_model=OrderStatusUpdateResponse,
+)
+def change_order_status(
+    request: OrderStatusUpdateRequest,
+    order_id: str = Path(
+        alias="orderId",
+        pattern=r"^[a-f0-9]{32}$",
+    ),
+):
+    """주문 상태를 다음 단계로 변경한다."""
+
+    try:
+        return update_order_status(
+            order_id=order_id,
+            new_status=request.status,
+        )
+
+    except ValueError as exc:
+        code = str(exc)
+
+        errors = {
+            "ORDER_NOT_FOUND": (
+                404, "주문을 찾을 수 없어요."
+            ),
+            "ORDER_STATUS_INVALID": (
+                409, "변경할 수 없는 주문 상태예요."
+            ),
+        }
+
+        if code not in errors:
+            raise
+
+        status_code, message = errors[code]
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "code": code,
+                "message": message,
+            },
+        )
+
+@admin_router.get(
+    "/orders",
+    response_model=OrderListResponse,
+)
+def read_orders(
+    store_id: str = Query(
+        alias="storeId",
+        min_length=1,
+    ),
+):
+    """매장의 전체 주문 목록을 조회한다."""
+
+    orders = get_orders(store_id=store_id)
+
+    return {
+        "orders": orders,
+    }

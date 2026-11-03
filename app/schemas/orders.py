@@ -65,3 +65,26 @@ class OrderReadResponse(BaseModel):
     items: list[OrderItemResponse]
     total_price: int = Field(alias="totalPrice")
     created_at: int = Field(alias="createdAt")
+
+class OrderStatusUpdateRequest(BaseModel):
+    """주문 상태 변경 요청."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["preparing", "completed"]
+
+
+class OrderStatusUpdateResponse(BaseModel):
+    """주문 상태 변경 결과."""
+
+    order_id: str = Field(alias="orderId")
+    status: Literal["preparing", "completed"]
+    image_id: Literal[
+        "preparing",
+        "ready",
+    ] = Field(alias="imageId")
+
+class OrderListResponse(BaseModel):
+    """매장 주문 목록 조회 결과."""
+
+    orders: list[OrderReadResponse]
