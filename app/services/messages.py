@@ -200,6 +200,20 @@ def validate_order_analysis(
     return result
 
 
+def _topic_particle(name: str) -> str:
+    """메뉴명 마지막 글자의 받침에 따라 은/는 선택."""
+    if not name:
+        return "는"
+
+    last = name[-1]
+    code = ord(last)
+
+    if 0xAC00 <= code <= 0xD7A3:
+        return "은" if (code - 0xAC00) % 28 else "는"
+
+    return "는"
+
+
 def generate_clarification_question(
     result: dict,
 ) -> str | None:
@@ -227,17 +241,17 @@ def generate_clarification_question(
 
     if code == "MENU_SOLD_OUT":
         return (
-            f"{name}는 품절이에요. "
+            f"{name}{_topic_particle(name)} 품절이에요. "
             "다른 메뉴를 말씀해 주세요."
         )
 
     if code in ("QUANTITY_REQUIRED", "QUANTITY_INVALID"):
-        return f"{name}는 몇 개 주문하시겠어요?"
+        return f"{name}{_topic_particle(name)} 몇 개 주문하시겠어요?"
 
     questions = {
         "size": f"{name}의 크기를 골라 주세요.",
         "temperature": (
-            f"{name}는 따뜻하게 드릴까요, "
+            f"{name}{_topic_particle(name)} 따뜻하게 드릴까요, "
             "차갑게 드릴까요?"
         ),
         "ice": f"{name}의 얼음은 얼마나 넣을까요?",
