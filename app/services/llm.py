@@ -238,24 +238,26 @@ def _rule_based_cart_command(
     text: str,
     menus: dict,
 ) -> OrderAnalysis | None:
-    """명확한 장바구니 수정·삭제 명령을 Gemini 없이 분석한다."""
+    """명확한 장바구니 변경·삭제 명령을 Gemini 없이 분석한다."""
 
     original = text.strip()
     normalized = re.sub(r"\s+", "", original)
 
-    # 전체 비우기
-    if (
-        re.search(r"장바구니|전체|전부|모두", normalized)
-        and re.search(r"비워|비우|전체삭제|전부삭제", normalized)
+    # 전체 장바구니 비우기: 확인 후 실제 삭제
+    if re.fullmatch(
+        r"(?:장바구니)?"
+        r"(?:전체|전부|모두)?"
+        r"(?:취소|삭제|비워|비우기|지워)"
+        r"(?:해줘|해주세요|해|줘|주세요|요)?",
+        normalized,
     ):
         return OrderAnalysis.model_validate({
             "intent": "clear_cart",
             "items": [],
         })
 
-    # 변경/삭제 의도 구분
     remove = bool(re.search(
-        r"삭제|지워|지워줘|빼줘|빼주세요",
+        r"삭제|지워|빼|제거",
         normalized,
     ))
     update = bool(re.search(
@@ -263,13 +265,11 @@ def _rule_based_cart_command(
         normalized,
     ))
 
-    # 서로 충돌하거나 의도가 불명확하면 Gemini로 전달
     if remove == update:
         return None
 
     intent = "remove_item" if remove else "update_item"
 
-    # 메뉴가 정확히 하나만 언급된 경우 처리
     matched = [
         (menu_id, menu["name"])
         for menu_id, menu in menus.items()
@@ -283,49 +283,56 @@ def _rule_based_cart_command(
 
     menu_id, menu_name = matched[0]
 
-    quantity = None
+    # 메뉴명을 제거한 나머지 발화에서 수량과 명령을 분석
+    remaining = normalized.replace(
+        re.sub(r"\s+", "", menu_name), "", 1
+    )
 
-    # 수정 명령의 수량 추출
-    if intent == "update_item":
-        quantity_match = re.search(
-            r"(한|하나|두|둘|세|셋|네|넷|[1-9][0-9]*)"
-            r"\s*(?:잔|개|장)",
-            original,
+    # 명령어 앞부분에서만 수량 추출
+    # "주세요"의 "세"를 수량 3으로 잘못 인식하지 않도록 한다.
+    quantity_text = re.split(
+        r"삭제|지워|빼|제거|변경|바꿔|수정",
+        remaining,
+        maxsplit=1,
+    )[0]
+
+    quantity = None
+    quantity_match = re.search(
+        r"(하나|한|두|둘|세|셋|네|넷|[1-9][0-9]*)"
+        r"(?:잔|개|장)?",
+        quantity_text,
+    )
+
+    if quantity_match:
+        raw = quantity_match.group(1)
+        quantity = {
+            "하나": 1, "한": 1,
+            "두": 2, "둘": 2,
+            "세": 3, "셋": 3,
+            "네": 4, "넷": 4,
+        }.get(raw)
+
+        if quantity is None:
+            quantity = int(raw)
+
+        remaining = (
+            remaining[:quantity_match.start()]
+            + remaining[quantity_match.end():]
         )
 
-        if quantity_match:
-            raw = quantity_match.group(1)
-            quantity = QUANTITY_WORDS.get(raw)
-
-            if quantity is None:
-                quantity = int(raw)
-
-        # 수량 변경 외 복잡한 수정 명령은 Gemini에 맡긴다.
-        if quantity is None:
-            return None
-
-    # 예상하지 못한 문구가 섞이면 규칙 기반으로 단정하지 않음
-    remaining = original.replace(menu_name, "", 1)
     remaining = re.sub(
-        r"(한|하나|두|둘|세|셋|네|넷|[1-9][0-9]*)"
-        r"\s*(?:잔|개|장)",
-        " ",
-        remaining,
-    )
-    remaining = re.sub(
-        r"삭제해줘|삭제해주세요|삭제|"
-        r"지워줘|지워주세요|지워|"
-        r"빼줘|빼주세요|"
-        r"변경해줘|변경해주세요|변경|"
-        r"바꿔줘|바꿔주세요|바꿔|"
-        r"수정해줘|수정해주세요|수정|"
-        r"주세요|줘요|줘|해줘|해요|해|"
+        r"삭제|지워|빼|제거|"
+        r"변경|바꿔|수정|"
+        r"주세요|줘요|줘|해요|해|"
         r"으로|로|요|좀",
-        " ",
+        "",
         remaining,
     )
 
-    if remaining.strip():
+    if remaining:
+        return None
+
+    if intent == "update_item" and quantity is None:
         return None
 
     return OrderAnalysis.model_validate({

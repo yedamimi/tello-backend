@@ -13,10 +13,13 @@ from app.services.sessions import (
     _get_authenticated_session,
     _validate_quantity,
     get_session_cart,
+    update_cart_item,
+    delete_cart_item,
 )
 from app.services.voice_cart import (
     process_voice_cart_command,
     confirm_voice_clear,
+    find_cart_target,
 )
 from app.services.recommendations import (
     is_recommendation_request,
@@ -999,6 +1002,92 @@ def process_order_message(
         }
 
 
+    # 개별 장바구니 항목 삭제 확인
+    if dialog_state == "confirm_remove":
+        pending_ref = get_db_reference(
+            f"sessions/{session_id}/pendingCartRemoval"
+        )
+        pending = pending_ref.get() or {}
+
+        if normalized in YES_ANSWERS:
+            pending_ref.delete()
+            set_dialog_state(session_id, None)
+
+            cart = get_session_cart(session_id, session_token)
+            target = next(
+                (
+                    item for item in cart.get("items", [])
+                    if item.get("itemId") == pending.get("itemId")
+                ),
+                None,
+            )
+
+            # 확인 중 다른 요청으로 장바구니가 바뀌었다면 삭제하지 않음
+            if (
+                not target
+                or target.get("menuId") != pending.get("menuId")
+                or target.get("quantity") != pending.get("originalQuantity")
+            ):
+                return {
+                    "intent": "remove_item",
+                    "items": [],
+                    "issues": [],
+                    "needsClarification": False,
+                    "question": "주문 내용이 변경됐어요. 장바구니를 다시 확인해 주세요.",
+                    "cart": cart,
+                    "nextAction": "review_cart",
+                }
+
+            remove_quantity = pending.get("removeQuantity")
+            current_quantity = target["quantity"]
+
+            if remove_quantity is None or remove_quantity >= current_quantity:
+                cart = delete_cart_item(
+                    session_id, session_token, target["itemId"]
+                )
+                question = "메뉴를 삭제했어요."
+            else:
+                cart = update_cart_item(
+                    session_id,
+                    session_token,
+                    target["itemId"],
+                    {"quantity": current_quantity - remove_quantity},
+                )
+                question = f"{remove_quantity}개를 뺐어요."
+
+            return {
+                "intent": "remove_item",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": question,
+                "cart": cart,
+                "nextAction": "cart_updated",
+            }
+
+        if normalized in NO_ANSWERS:
+            pending_ref.delete()
+            set_dialog_state(session_id, None)
+            return {
+                "intent": "answer",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": "알겠어요. 주문 내용을 그대로 유지할게요.",
+                "cart": get_session_cart(session_id, session_token),
+                "nextAction": "cart_updated",
+            }
+
+        return {
+            "intent": "answer",
+            "items": [],
+            "issues": [],
+            "needsClarification": True,
+            "question": "메뉴를 뺄까요? 네 또는 아니요로 답해 주세요.",
+            "cart": None,
+            "nextAction": "confirm_remove",
+        }
+
     # 1. 장바구니 전체 비우기 확인
     if dialog_state == "confirm_clear":
         if normalized in YES_ANSWERS:
@@ -1391,6 +1480,95 @@ def process_order_message(
                 text=text,
             )
 
+
+    # 개별 삭제는 사용자 확인을 받은 뒤에만 적용
+    if analysis.intent == "remove_item":
+        cart = get_session_cart(session_id, session_token)
+
+        if len(analysis.items) != 1:
+            return {
+                "intent": "remove_item",
+                "items": [],
+                "issues": [],
+                "needsClarification": True,
+                "question": "삭제할 메뉴를 하나씩 말씀해 주세요.",
+                "cart": cart,
+                "nextAction": "clarification",
+            }
+
+        item = analysis.items[0]
+        target_result = find_cart_target(
+            cart, item, intent="remove_item"
+        )
+
+        if target_result["status"] == "ambiguous":
+            return {
+                "intent": "remove_item",
+                "items": [],
+                "issues": [],
+                "needsClarification": True,
+                "question": "같은 메뉴가 여러 개 있어요. 삭제할 항목을 골라 주세요.",
+                "cart": cart,
+                "nextAction": "select_cart_item",
+                "candidates": target_result["candidates"],
+            }
+
+        if target_result["status"] != "matched":
+            return {
+                "intent": "remove_item",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": "장바구니에서 해당 메뉴를 찾지 못했어요.",
+                "cart": cart,
+                "nextAction": "review_cart",
+            }
+
+        target = next(
+            item for item in cart["items"]
+            if item["itemId"] == target_result["itemId"]
+        )
+
+        remove_quantity = analysis.items[0].quantity
+        current_quantity = target["quantity"]
+
+        if remove_quantity is not None and remove_quantity <= 0:
+            return {
+                "intent": "remove_item",
+                "items": [],
+                "issues": [],
+                "needsClarification": True,
+                "question": "뺄 수량을 다시 말씀해 주세요.",
+                "cart": cart,
+                "nextAction": "clarification",
+            }
+
+        get_db_reference(
+            f"sessions/{session_id}/pendingCartRemoval"
+        ).set({
+            "itemId": target["itemId"],
+            "menuId": target["menuId"],
+            "originalQuantity": current_quantity,
+            "removeQuantity": remove_quantity,
+        })
+
+        set_dialog_state(session_id, "confirm_remove")
+
+        name = target.get("name") or item.menu_text or "해당 메뉴"
+        if remove_quantity is None:
+            question = f"{name}을(를) 삭제할까요?"
+        else:
+            question = f"{name} {remove_quantity}개를 뺄까요?"
+
+        return {
+            "intent": "remove_item",
+            "items": [],
+            "issues": [],
+            "needsClarification": True,
+            "question": question,
+            "cart": cart,
+            "nextAction": "confirm_remove",
+        }
 
     # 4. 변경·삭제·전체 비우기 명령
     if analysis.intent in (

@@ -45,7 +45,8 @@ def is_recommendation_request(text: str) -> bool:
     """추천을 명시적으로 요청했는지 확인한다."""
     return bool(re.search(
         r"추천|뭐\s*마실|뭘\s*마실|"
-        r"뭐\s*먹을|뭘\s*먹을",
+        r"뭐\s*먹을|뭘\s*먹을|"
+        r"(?:안\s*쓰고|달달|달콤).*(?:있어요|있나요|추천)",
         text,
     ))
 
@@ -99,6 +100,44 @@ def recommend_menus(
     메뉴 특성은 Firebase의 tasteTags,
     recommendTemperature를 기준으로 사용한다.
     """
+
+    # 시연 매장의 티 음료 요청: 판매 중인 사과주스를 대안으로 안내
+    if re.search(r"티\s*음료", text):
+        menus = get_store_menus(store_id) or {}
+        menu = menus.get("apple_juice")
+
+        available = (
+            isinstance(menu, dict)
+            and menu.get("isAvailable") is True
+            and "apple_juice" not in (exclude_menu_ids or set())
+        )
+
+        candidates = [{
+            "menuId": "apple_juice",
+            "name": menu.get("name", "사과주스"),
+            "price": menu.get("price", 0),
+            "category": menu.get("category"),
+            "tasteTags": menu.get("tasteTags") or [],
+        }] if available else []
+
+        return {
+            "intent": "recommend",
+            "items": [],
+            "issues": [],
+            "needsClarification": not bool(candidates),
+            "question": (
+                "죄송해요, 지금은 티 음료가 없어요. "
+                "대신 커피가 아닌 사과주스는 어떠세요?"
+                if candidates
+                else "지금은 티 음료가 없고, 추천할 대안 메뉴도 없어요."
+            ),
+            "cart": None,
+            "nextAction": (
+                "show_recommendations" if candidates
+                else "recommend_empty"
+            ),
+            "candidates": candidates,
+        }
 
     preferences = extract_preferences(text)
     menus = get_store_menus(store_id) or {}
@@ -209,9 +248,14 @@ def recommend_menus(
             )
         )
     else:
+        sweet_priority = (
+            {"vanilla_latte": 0, "choco_milk": 1}
+            if "sweet" in tastes else {}
+        )
         candidates.sort(
             key=lambda item: (
                 -item["score"],
+                sweet_priority.get(item["menuId"], 100),
                 item["price"],
                 item["menuId"],
             )
