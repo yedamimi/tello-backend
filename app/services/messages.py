@@ -1014,6 +1014,142 @@ def process_order_message(
             "nextAction": "confirm_clear",
         }
 
+
+    # 함께 먹을 메뉴 추천에 대한 수락·거절
+    if dialog_state == "pairing_offer":
+        if normalized in {
+            "네", "예", "응", "네담아주세요",
+            "담아주세요", "이걸로할게요",
+            "크루아상요", "크루아상",
+        }:
+            menus = get_store_menus(store_id) or {}
+            menu = menus.get("croissant")
+
+            if (
+                not isinstance(menu, dict)
+                or menu.get("isAvailable") is not True
+            ):
+                set_dialog_state(session_id, None)
+                return {
+                    "intent": "browse_menu",
+                    "items": [],
+                    "issues": [],
+                    "needsClarification": False,
+                    "question": "크루아상을 지금 주문할 수 없어요. 메뉴판을 확인해 주세요.",
+                    "cart": None,
+                    "nextAction": "show_menu",
+                }
+
+            analysis = OrderAnalysis(
+                intent="add_item",
+                items=[
+                    AnalyzedItem.model_validate({
+                        "menu_id": "croissant",
+                        "menu_text": menu.get("name", "croissant"),
+                        "quantity": None,
+                        "options": {
+                            "size": None,
+                            "temperature": None,
+                            "ice": None,
+                        },
+                    })
+                ],
+            )
+
+            set_dialog_state(session_id, None)
+            result = validate_order_analysis(store_id, analysis)
+            result["question"] = generate_clarification_question(result)
+            result["cart"] = None
+            result["nextAction"] = "clarification"
+
+            if result["needsClarification"]:
+                save_pending_order(session_id, result)
+                return result
+
+            result["cart"] = add_analyzed_items(
+                session_id, session_token, result["items"]
+            )
+            result["question"] = "더 필요한 게 있나요?"
+            result["nextAction"] = "ask_more"
+            set_dialog_state(session_id, "awaiting_more")
+            return result
+
+        if normalized in {"아니요", "아니", "아뇨", "괜찮아요"}:
+            set_dialog_state(session_id, "awaiting_more")
+            return {
+                "intent": "answer",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": "알겠어요. 더 필요한 게 있나요?",
+                "cart": None,
+                "nextAction": "ask_more",
+            }
+
+        return {
+            "intent": "answer",
+            "items": [],
+            "issues": [],
+            "needsClarification": True,
+            "question": "크루아상을 담을까요? 네 또는 아니요로 답해 주세요.",
+            "cart": None,
+            "nextAction": "confirm_pairing",
+        }
+
+    # 커피 주문 후 함께 먹을 디저트 추천
+    if (
+        dialog_state == "awaiting_more"
+        and "추천" in normalized
+        and any(
+            word in normalized
+            for word in ("같이먹을", "함께먹을", "곁들일")
+        )
+    ):
+        menus = get_store_menus(store_id) or {}
+        saved_items = get_db_reference(
+            f"sessions/{session_id}/cart/items"
+        ).get() or {}
+
+        has_coffee = any(
+            isinstance(item, dict)
+            and isinstance(menus.get(item.get("menuId")), dict)
+            and menus[item["menuId"]].get("category") == "coffee"
+            for item in saved_items.values()
+        )
+
+        croissant = menus.get("croissant")
+
+        if (
+            has_coffee
+            and isinstance(croissant, dict)
+            and croissant.get("isAvailable") is True
+        ):
+            get_db_reference(
+                f"sessions/{session_id}/recommendationContext"
+            ).delete()
+            set_dialog_state(session_id, "pairing_offer")
+
+            name = croissant.get("name", "크루아상")
+            price = croissant.get("price", 0)
+
+            return {
+                "intent": "recommend",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": (
+                    f"커피와 함께라면 {name}을 추천해요. "
+                    f"{price:,}원이에요. 담을까요?"
+                ),
+                "cart": None,
+                "nextAction": "confirm_pairing",
+                "candidates": [{
+                    "menuId": "croissant",
+                    "name": name,
+                    "price": price,
+                }],
+            }
+
     # 2. 담기 완료 후 추가 주문 여부
     if dialog_state == "awaiting_more":
         if normalized in YES_ANSWERS:
