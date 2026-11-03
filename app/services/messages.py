@@ -705,6 +705,129 @@ def _detect_unavailable_menu_name(
     return name
 
 
+
+def _handle_menu_browsing(
+    session_id: str,
+    store_id: str,
+    normalized: str,
+) -> dict | None:
+    """Firebase 메뉴 기준으로 목록과 가격 질문 처리."""
+    browse_words = (
+        "어떤메뉴", "무슨메뉴", "메뉴뭐",
+        "메뉴가있", "메뉴보여", "메뉴판",
+    )
+    noncoffee_words = (
+        "커피말고", "커피아닌", "커피빼고",
+    )
+
+    is_browse = any(w in normalized for w in browse_words)
+    is_noncoffee = any(w in normalized for w in noncoffee_words)
+    is_price = "얼마" in normalized or "가격" in normalized
+
+    if not (is_browse or is_noncoffee or is_price):
+        return None
+
+    menus = get_store_menus(store_id) or {}
+    available = [
+        (menu_id, menu)
+        for menu_id, menu in menus.items()
+        if isinstance(menu, dict)
+        and menu.get("isAvailable") is True
+    ]
+
+    def response(question, action, candidates=None):
+        return {
+            "intent": "browse_menu",
+            "items": [],
+            "issues": [],
+            "needsClarification": action == "confirm_menu_selection",
+            "question": question,
+            "cart": None,
+            "nextAction": action,
+            "candidates": candidates or [],
+        }
+
+    if is_price:
+        matches = [
+            (menu_id, menu)
+            for menu_id, menu in available
+            if _normalize(str(menu.get("name") or ""))
+            in normalized
+        ]
+        if matches:
+            menu_id, menu = max(
+                matches,
+                key=lambda pair: len(pair[1].get("name") or ""),
+            )
+            name = menu["name"]
+            price = menu.get("price", 0)
+            size_options = menu.get("sizeOptions") or {}
+            extra = (
+                " 큰 사이즈는 500원 추가돼요."
+                if "large" in size_options else ""
+            )
+
+            get_db_reference(
+                f"sessions/{session_id}/menuBrowseSelection"
+            ).set({
+                "menuId": menu_id,
+                "name": name,
+            })
+            set_dialog_state(
+                session_id, "menu_price_offer"
+            )
+
+            return response(
+                f"{name}는 {price:,}원이에요."
+                f"{extra} 이걸로 할까요?",
+                "confirm_menu_selection",
+                [{
+                    "menuId": menu_id,
+                    "name": name,
+                    "price": price,
+                }],
+            )
+
+        return response(
+            "메뉴판에서 가격을 확인할 수 있어요. "
+            "원하는 메뉴를 골라 주세요.",
+            "show_menu",
+        )
+
+    if is_noncoffee:
+        selected = [
+            menu for _, menu in available
+            if menu.get("category") != "coffee"
+        ]
+        names = [
+            str(menu.get("name"))
+            for menu in selected
+            if menu.get("name")
+        ]
+        question = (
+            "커피가 아닌 메뉴로는 "
+            + ", ".join(names)
+            + "가 있어요. 메뉴판에서 골라 주세요."
+            if names else
+            "현재 판매 중인 다른 메뉴가 없어요."
+        )
+        return response(question, "show_menu")
+
+    names = [
+        str(menu.get("name"))
+        for _, menu in available
+        if menu.get("name")
+    ]
+    question = (
+        "판매 중인 메뉴는 "
+        + ", ".join(names)
+        + "예요. 사진으로도 골라 보세요."
+        if names else
+        "현재 판매 중인 메뉴가 없어요."
+    )
+    return response(question, "show_menu")
+
+
 def process_order_message(
     session_id: str,
     session_token: str,
@@ -728,6 +851,79 @@ def process_order_message(
     normalized = _normalize(text)
 
     dialog_state = get_dialog_state(session_id)
+
+    if dialog_state == "menu_price_offer":
+        selection_ref = get_db_reference(
+            f"sessions/{session_id}/menuBrowseSelection"
+        )
+        selection = selection_ref.get()
+
+        accepted = {
+            "네", "네이걸로할게요", "이걸로할게요",
+            "네이걸로주세요", "이걸로주세요",
+            "응", "예", "좋아요",
+        }
+        rejected = {
+            "아니요", "아니", "다른메뉴볼래요",
+            "메뉴판볼게요", "다른메뉴",
+        }
+
+        if normalized in accepted and isinstance(selection, dict):
+            selection_ref.delete()
+            set_dialog_state(session_id, None)
+
+            item = AnalyzedItem.model_validate({
+                "menu_id": selection["menuId"],
+                "menu_text": selection["name"],
+                "quantity": None,
+                "options": {
+                    "size": None,
+                    "temperature": None,
+                    "ice": None,
+                },
+            })
+            analysis = OrderAnalysis(
+                intent="add_item",
+                items=[item],
+            )
+            result = validate_order_analysis(
+                store_id, analysis
+            )
+            result["question"] = (
+                generate_clarification_question(result)
+            )
+            result["cart"] = None
+            result["nextAction"] = "clarification"
+
+            if result["needsClarification"]:
+                save_pending_order(session_id, result)
+                return result
+
+            result["cart"] = add_analyzed_items(
+                session_id, session_token, result["items"]
+            )
+            result["nextAction"] = "ask_more"
+            result["question"] = "더 필요한 게 있나요?"
+            set_dialog_state(session_id, "awaiting_more")
+            return result
+
+        if normalized in rejected:
+            selection_ref.delete()
+            set_dialog_state(session_id, None)
+            return {
+                "intent": "browse_menu",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": "다른 메뉴를 골라 주세요.",
+                "cart": None,
+                "nextAction": "show_menu",
+            }
+
+        # 새로운 요청은 이전 가격 확인 상태를 종료하고 처리
+        selection_ref.delete()
+        set_dialog_state(session_id, None)
+
 
     if dialog_state == "unknown_menu_offer":
         if normalized in {
@@ -872,6 +1068,12 @@ def process_order_message(
                 "nextAction": "clarification",
             }
     else:
+        browse_result = _handle_menu_browsing(
+            session_id, store_id, normalized
+        )
+        if browse_result is not None:
+            return browse_result
+
         # Preserve recommendation preferences until a menu is selected.
         recommendation_ref = get_db_reference(
             f"sessions/{session_id}/recommendationContext"
