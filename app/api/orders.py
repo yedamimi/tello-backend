@@ -173,8 +173,8 @@ def read_order(
             ),
         )
 
-@router.patch(
-    "/{orderId}/status",
+@admin_router.patch(
+    "/orders/{orderId}/status",
     response_model=OrderStatusUpdateResponse,
 )
 def change_order_status(
