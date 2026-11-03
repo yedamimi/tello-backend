@@ -7,6 +7,10 @@ from app.api.orders import (
     router as orders_router,
     admin_router as admin_orders_router,
 )
+from app.api.help_requests import (
+    router as help_requests_router,
+    admin_router as admin_help_requests_router,
+)
 
 app = FastAPI(title="Tello Backend")
 
@@ -15,6 +19,8 @@ app.include_router(stores_router)
 app.include_router(admin_orders_router, prefix="/api")
 app.include_router(messages_router)
 app.include_router(orders_router, prefix="/api")
+app.include_router(help_requests_router)
+app.include_router(admin_help_requests_router)
 
 @app.get("/api/health")
 def health_check():
