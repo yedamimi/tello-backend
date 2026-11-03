@@ -675,6 +675,36 @@ def _resolve_pending_correction(
     )
 
 
+
+def _detect_unavailable_menu_name(
+    normalized: str,
+    store_id: str,
+) -> str | None:
+    """단순 주문에서 확인 가능한 미등록 메뉴만 감지."""
+
+    match = re.fullmatch(
+        r"(?P<name>[가-힣]{2,15}"
+        r"(?:라떼|에이드|주스|우유|커피|티))"
+        r"(?:(?:한|두|세|[1-9])(?:잔|개)|하나|둘|셋)?"
+        r"(?:주세요|줘요|줘|요)?",
+        normalized,
+    )
+
+    if not match:
+        return None
+
+    name = match.group("name")
+    menus = get_store_menus(store_id) or {}
+
+    for menu in menus.values():
+        if not isinstance(menu, dict):
+            continue
+        if _normalize(str(menu.get("name") or "")) == name:
+            return None
+
+    return name
+
+
 def process_order_message(
     session_id: str,
     session_token: str,
@@ -698,6 +728,66 @@ def process_order_message(
     normalized = _normalize(text)
 
     dialog_state = get_dialog_state(session_id)
+
+    if dialog_state == "unknown_menu_offer":
+        if normalized in {
+            "네", "예", "응", "추천해주세요",
+            "네추천해주세요", "추천해줘요",
+        }:
+            set_dialog_state(session_id, None)
+            recommendation_text = "달달한 음료 추천해 줘"
+            result = recommend_menus(
+                store_id=store_id,
+                text=recommendation_text,
+            )
+
+            candidates = result.get("candidates") or []
+            if candidates:
+                get_db_reference(
+                    f"sessions/{session_id}/recommendationContext"
+                ).set({
+                    "temperature": None,
+                    "originalText": recommendation_text,
+                    "refusalCount": 0,
+                    "excludedMenuIds": [],
+                    "candidates": [
+                        {
+                            "menuId": item["menuId"],
+                            "name": item["name"],
+                        }
+                        for item in candidates
+                    ],
+                })
+            return result
+
+        if normalized in {
+            "메뉴판볼게요", "메뉴판",
+            "아니요", "아니", "아뇨",
+        }:
+            set_dialog_state(session_id, None)
+            return {
+                "intent": "browse_menu",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": "메뉴판을 열어 드릴게요.",
+                "cart": None,
+                "nextAction": "show_menu",
+            }
+
+        return {
+            "intent": "answer",
+            "items": [],
+            "issues": [],
+            "needsClarification": True,
+            "question": (
+                "다른 메뉴를 추천해 드릴까요? "
+                "추천해 주세요 또는 메뉴판 볼게요로 답해 주세요."
+            ),
+            "cart": None,
+            "nextAction": "clarification",
+        }
+
 
     # 1. 장바구니 전체 비우기 확인
     if dialog_state == "confirm_clear":
@@ -787,6 +877,86 @@ def process_order_message(
             f"sessions/{session_id}/recommendationContext"
         )
 
+        unavailable_name = _detect_unavailable_menu_name(
+            normalized, store_id
+        )
+        if unavailable_name is not None:
+            recommendation_ref.delete()
+            set_dialog_state(session_id, "unknown_menu_offer")
+            return {
+                "intent": "add_item",
+                "items": [],
+                "issues": [{
+                    "itemIndex": 0,
+                    "code": "MENU_UNKNOWN",
+                    "field": "menuId",
+                }],
+                "needsClarification": True,
+                "question": (
+                    f"죄송해요, {unavailable_name}는 지금 팔지 않아요. "
+                    "다른 메뉴를 추천해 드릴까요?"
+                ),
+                "cart": None,
+                "nextAction": "clarification",
+            }
+
+        context = recommendation_ref.get()
+
+        rejection_words = (
+            "다른추천", "다른거추천", "다른메뉴추천",
+            "다른거", "다른메뉴",
+            "둘다별로", "둘다싫", "별로예요",
+            "마음에안들", "추천다시",
+        )
+        is_rejection = any(
+            word in normalized for word in rejection_words
+        )
+
+        if isinstance(context, dict) and is_rejection:
+            refusals = int(context.get("refusalCount") or 0) + 1
+            excluded = set(context.get("excludedMenuIds") or [])
+
+            for candidate in context.get("candidates") or []:
+                if isinstance(candidate, dict):
+                    menu_id = candidate.get("menuId")
+                    if menu_id:
+                        excluded.add(menu_id)
+
+            if refusals < 2:
+                result = recommend_menus(
+                    store_id=store_id,
+                    text=context.get("originalText") or text,
+                    exclude_menu_ids=excluded,
+                )
+
+                if result.get("candidates"):
+                    context["refusalCount"] = refusals
+                    context["excludedMenuIds"] = sorted(excluded)
+                    context["candidates"] = [
+                        {
+                            "menuId": item["menuId"],
+                            "name": item["name"],
+                        }
+                        for item in result["candidates"]
+                    ]
+                    recommendation_ref.set(context)
+                    return result
+
+            recommendation_ref.delete()
+            return {
+                "intent": "recommend",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": (
+                    "메뉴판을 열어 드릴게요. "
+                    "사진을 보고 골라 주세요."
+                ),
+                "cart": None,
+                "nextAction": "show_menu",
+                "candidates": [],
+            }
+
         if is_recommendation_request(text):
             result = recommend_menus(
                 store_id=store_id,
@@ -799,6 +969,9 @@ def process_order_message(
                 preferences = extract_preferences(text)
                 recommendation_ref.set({
                     "temperature": preferences.get("temperature"),
+                    "originalText": text,
+                    "refusalCount": 0,
+                    "excludedMenuIds": [],
                     "candidates": [
                         {
                             "menuId": candidate["menuId"],

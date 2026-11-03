@@ -92,6 +92,7 @@ def recommend_menus(
     store_id: str,
     text: str,
     limit: int = 2,
+    exclude_menu_ids: set[str] | None = None,
 ) -> dict:
     """판매 중인 메뉴에서 조건에 맞는 후보를 추천한다.
 
@@ -122,8 +123,11 @@ def recommend_menus(
         }
 
     candidates = []
+    excluded = set(exclude_menu_ids or [])
 
     for menu_id, menu in menus.items():
+        if menu_id in excluded:
+            continue
         if not isinstance(menu, dict):
             continue
 
@@ -190,13 +194,28 @@ def recommend_menus(
         })
 
     # 높은 일치 점수, 낮은 가격, 메뉴 ID 순서
-    candidates.sort(
-        key=lambda item: (
-            -item["score"],
-            item["price"],
-            item["menuId"],
+    if not tastes and not category and not temperature:
+        priority = {
+            "americano": 0,
+            "cafe_latte": 1,
+            "vanilla_latte": 2,
+            "choco_milk": 3,
+        }
+        candidates.sort(
+            key=lambda item: (
+                priority.get(item["menuId"], 100),
+                item["price"],
+                item["menuId"],
+            )
         )
-    )
+    else:
+        candidates.sort(
+            key=lambda item: (
+                -item["score"],
+                item["price"],
+                item["menuId"],
+            )
+        )
 
     # 내부 정렬 점수는 프론트에 전달하지 않음
     selected = []
