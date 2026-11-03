@@ -699,6 +699,19 @@ def _detect_unavailable_menu_name(
 ) -> str | None:
     """단순 주문에서 확인 가능한 미등록 메뉴만 감지."""
 
+    # 등록된 서로 다른 메뉴가 2개 이상 포함되면 복합 주문으로 처리
+    menus = get_store_menus(store_id) or {}
+    matched_menu_ids = {
+        menu_id
+        for menu_id, menu in menus.items()
+        if isinstance(menu, dict)
+        and isinstance(menu.get("name"), str)
+        and _normalize(menu["name"]) in normalized
+    }
+
+    if len(matched_menu_ids) >= 2:
+        return None
+
     match = re.fullmatch(
         r"(?P<name>[가-힣]{2,15}"
         r"(?:라떼|에이드|주스|우유|커피|티))"
@@ -1286,6 +1299,69 @@ def process_order_message(
     pending = get_pending_order(session_id)
 
     if pending:
+        # COMMON_TEMPERATURE_FOLLOWUP
+        # 복합 주문에 명시된 공통 온도를 모든 메뉴에 적용
+        common_temperatures = {
+            "둘다아이스": "ice",
+            "둘다차갑게": "ice",
+            "둘다핫": "hot",
+            "둘다따뜻하게": "hot",
+        }
+
+        common_temperature = common_temperatures.get(normalized)
+        pending_items = pending.get("items") or []
+
+        if common_temperature and len(pending_items) >= 2:
+            updated_items = []
+
+            for pending_item in pending_items:
+                updated_item = dict(pending_item)
+                options = {
+                    "size": None,
+                    "temperature": None,
+                    "ice": None,
+                    **(updated_item.get("options") or {}),
+                }
+
+                options["temperature"] = common_temperature
+
+                if common_temperature == "hot":
+                    options["ice"] = None
+
+                updated_item["options"] = options
+                updated_items.append(updated_item)
+
+            updated_analysis = OrderAnalysis.model_validate({
+                "intent": "add_item",
+                "items": updated_items,
+            })
+
+            result = validate_order_analysis(
+                store_id, updated_analysis
+            )
+
+            result["question"] = generate_clarification_question(
+                result
+            )
+            result["cart"] = None
+            result["nextAction"] = "clarification"
+
+            if result["needsClarification"]:
+                save_pending_order(session_id, result)
+                return result
+
+            get_db_reference(
+                f"sessions/{session_id}/pendingOrder"
+            ).delete()
+
+            result["cart"] = add_analyzed_items(
+                session_id, session_token, result["items"]
+            )
+            result["question"] = "더 필요한 게 있나요?"
+            result["nextAction"] = "ask_more"
+            set_dialog_state(session_id, "awaiting_more")
+            return result
+
         analysis = (
             _resolve_pending_correction(
                 pending, text, store_id

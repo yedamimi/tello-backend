@@ -350,6 +350,9 @@ def _rule_based_cart_command(
     })
 
 
+MENU_ALIASES.setdefault("뜨아", ("americano", "hot"))
+
+
 def _rule_based_analysis(
     text: str,
     menus: dict,
@@ -360,6 +363,9 @@ def _rule_based_analysis(
     """
 
     original = text.strip()
+
+    # "크루아상 하나요"처럼 수량 뒤에 바로 종결어미가 붙은 표현 처리
+    original = re.sub(r"(?<=\s)하나요$", "하나 주세요", original)
     normalized = re.sub(r"[,.!?]", " ", original).strip()
 
     if COMPLEX_WORDS.search(normalized):
@@ -554,6 +560,40 @@ def _gemini_analysis(
         raise ValueError("LLM_INVALID_RESPONSE") from exc
 
 
+def _rule_based_multi_item(
+    text: str,
+    menus: dict,
+) -> OrderAnalysis | None:
+    """구분자로 명확히 나뉜 복합 주문을 규칙 기반으로 분석한다."""
+    parts = re.split(
+        r"\s*(?:,|，|랑|하고)\s*",
+        text.strip(),
+    )
+    parts = [part.strip() for part in parts if part.strip()]
+
+    if len(parts) < 2:
+        return None
+
+    items = []
+
+    for part in parts:
+        result = _rule_based_analysis(part, menus)
+
+        if (
+            result is None
+            or result.intent != "add_item"
+            or len(result.items) != 1
+        ):
+            return None
+
+        items.append(result.items[0].model_dump())
+
+    return OrderAnalysis.model_validate({
+        "intent": "add_item",
+        "items": items,
+    })
+
+
 def analyze_order_text(
     store_id: str,
     text: str,
@@ -590,6 +630,15 @@ def analyze_order_text(
     if result is not None:
         print(
             "3. 규칙 기반 장바구니 명령 분석 완료",
+            flush=True,
+        )
+        return result
+
+    # 명확한 복합 주문은 Gemini 없이 분석
+    result = _rule_based_multi_item(text, menus)
+    if result is not None:
+        print(
+            "3. 규칙 기반 복합 주문 분석 완료 (Gemini 호출 없음)",
             flush=True,
         )
         return result
