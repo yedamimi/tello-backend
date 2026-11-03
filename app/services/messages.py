@@ -611,6 +611,9 @@ def _resolve_pending_correction(
             normalized,
         )
 
+        # "아니요, 카페라떼요"의 쉼표 등 구분 기호 제거
+        correction = re.sub(r"^[,，.!?]+", "", correction)
+
         menus = get_store_menus(store_id) or {}
 
         matches = []
@@ -646,7 +649,8 @@ def _resolve_pending_correction(
     else:
         # "따뜻한 걸로 바꿀게요" 등 온도 정정
         correction_words = (
-            "바꿔", "바꿀", "변경", "아니"
+            "바꿔", "바꿀", "변경", "아니",
+            "걸로", "것으로",
         )
         is_correction = any(
             word in normalized for word in correction_words
@@ -1264,6 +1268,71 @@ def process_order_message(
                     "name": name,
                     "price": price,
                 }],
+            }
+
+    # QUANTITY_CORRECTION_FOLLOWUP
+    # "아니요, 한 잔이요"처럼 직전 담기 후 수량 정정
+    if dialog_state == "awaiting_more":
+        correction_text = re.sub(r"[,，.!?。]", "", normalized)
+        quantity_match = re.fullmatch(
+            r"(?:아니요|아니|아뇨)"
+            r"(하나|한|두|둘|세|셋|네|넷|[1-9][0-9]*)"
+            r"(?:잔|개|장)(?:이요|요)?",
+            correction_text,
+        )
+
+        if quantity_match:
+            quantity_word = quantity_match.group(1)
+            quantity = {
+                "하나": 1, "한": 1,
+                "두": 2, "둘": 2,
+                "세": 3, "셋": 3,
+                "네": 4, "넷": 4,
+            }.get(quantity_word)
+
+            if quantity is None:
+                quantity = int(quantity_word)
+
+            cart = get_session_cart(session_id, session_token)
+            cart_items = cart.get("items") or []
+
+            if len(cart_items) != 1:
+                return {
+                    "intent": "answer",
+                    "items": [],
+                    "issues": [],
+                    "needsClarification": True,
+                    "question": (
+                        "어떤 메뉴의 수량을 바꿀까요? "
+                        "메뉴 이름과 수량을 함께 말씀해 주세요."
+                    ),
+                    "cart": cart,
+                    "nextAction": "clarification",
+                }
+
+            target = cart_items[0]
+
+            updated_cart = update_cart_item(
+                session_id,
+                session_token,
+                target["itemId"],
+                {"quantity": quantity},
+            )
+
+            set_dialog_state(session_id, "awaiting_more")
+
+            return {
+                "intent": "update_item",
+                "items": [],
+                "issues": [],
+                "needsClarification": False,
+                "question": (
+                    f"{target['name']} 수량을 "
+                    f"{quantity}개로 변경했어요. "
+                    "더 필요한 게 있나요?"
+                ),
+                "cart": updated_cart,
+                "nextAction": "cart_updated",
             }
 
     # 2. 담기 완료 후 추가 주문 여부
