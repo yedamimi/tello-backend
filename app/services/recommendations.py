@@ -91,7 +91,7 @@ def extract_preferences(text: str) -> dict:
 def recommend_menus(
     store_id: str,
     text: str,
-    limit: int = 3,
+    limit: int = 2,
 ) -> dict:
     """판매 중인 메뉴에서 조건에 맞는 후보를 추천한다.
 

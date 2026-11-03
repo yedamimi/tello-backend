@@ -21,6 +21,7 @@ from app.services.voice_cart import (
 from app.services.recommendations import (
     is_recommendation_request,
     recommend_menus,
+    extract_preferences,
 )
 
 
@@ -557,6 +558,123 @@ def add_analyzed_items(
 
 
 
+
+def _resolve_pending_correction(
+    pending: dict,
+    answer: str,
+    store_id: str,
+) -> OrderAnalysis | None:
+    """미완성 주문 중 명확한 메뉴/온도 정정 처리."""
+
+    items = pending.get("items") or []
+    issues = pending.get("issues") or []
+
+    if not items or not issues:
+        return None
+
+    index = issues[0].get("itemIndex")
+
+    if type(index) is not int or not 0 <= index < len(items):
+        return None
+
+    normalized = _normalize(answer)
+    current = dict(items[index])
+    options = dict(current.get("options") or {})
+
+    new_menu_id = None
+    new_menu_name = None
+
+    # "아니요 카페라떼요"처럼 메뉴를 정정하는 경우
+    if normalized.startswith((
+        "아니요", "아니", "아뇨", "그거말고"
+    )):
+        correction = re.sub(
+            r"^(아니요|아니|아뇨|그거말고)",
+            "",
+            normalized,
+        )
+
+        menus = get_store_menus(store_id) or {}
+
+        matches = []
+        for menu_id, menu in menus.items():
+            if not isinstance(menu, dict):
+                continue
+
+            name = menu.get("name")
+            if not isinstance(name, str):
+                continue
+
+            clean_name = _normalize(name)
+
+            forms = {
+                clean_name,
+                clean_name + "요",
+                clean_name + "로요",
+                clean_name + "로바꿀게요",
+                clean_name + "로바꿔줘",
+                clean_name + "로바꿔주세요",
+            }
+
+            if correction in forms:
+                matches.append((menu_id, name))
+
+        if len(matches) == 1:
+            new_menu_id, new_menu_name = matches[0]
+
+    if new_menu_id is not None:
+        current["menu_id"] = new_menu_id
+        current["menu_text"] = new_menu_name
+        current["options"] = {}
+    else:
+        # "따뜻한 걸로 바꿀게요" 등 온도 정정
+        correction_words = (
+            "바꿔", "바꿀", "변경", "아니"
+        )
+        is_correction = any(
+            word in normalized for word in correction_words
+        )
+
+        wants_hot = bool(re.search(
+            r"따뜻|뜨겁|핫", normalized
+        ))
+        wants_ice = bool(re.search(
+            r"아이스|차갑", normalized
+        ))
+
+        if not is_correction or wants_hot == wants_ice:
+            return None
+
+        if wants_hot:
+            options["temperature"] = "hot"
+            options.pop("ice", None)
+        else:
+            options["temperature"] = "ice"
+            options.pop("ice", None)
+
+        current["options"] = options
+
+    # Ensure every option field exists for Pydantic validation.
+    saved_options = current.get("options") or {}
+    current["options"] = {
+        key: saved_options.get(key)
+        for key in OPTION_FIELDS
+    }
+
+    updated_items = []
+
+    for position, previous in enumerate(items):
+        data = current if position == index else previous
+        updated_items.append(
+            AnalyzedItem.model_validate(data)
+        )
+
+    return OrderAnalysis(
+        intent="add_item",
+        items=updated_items,
+    )
+
+
 def process_order_message(
     session_id: str,
     session_token: str,
@@ -643,7 +761,12 @@ def process_order_message(
     pending = get_pending_order(session_id)
 
     if pending:
-        analysis = resolve_followup(pending, text)
+        analysis = (
+            _resolve_pending_correction(
+                pending, text, store_id
+            )
+            or resolve_followup(pending, text)
+        )
 
         if analysis is None:
             return {
@@ -659,17 +782,89 @@ def process_order_message(
                 "nextAction": "clarification",
             }
     else:
-        # 명시적인 메뉴 추천은 Gemini 없이 처리
+        # Preserve recommendation preferences until a menu is selected.
+        recommendation_ref = get_db_reference(
+            f"sessions/{session_id}/recommendationContext"
+        )
+
         if is_recommendation_request(text):
-            return recommend_menus(
+            result = recommend_menus(
                 store_id=store_id,
                 text=text,
             )
 
-        analysis = analyze_order_text(
-            store_id=store_id,
-            text=text,
-        )
+            candidates = result.get("candidates") or []
+
+            if candidates:
+                preferences = extract_preferences(text)
+                recommendation_ref.set({
+                    "temperature": preferences.get("temperature"),
+                    "candidates": [
+                        {
+                            "menuId": candidate["menuId"],
+                            "name": candidate["name"],
+                        }
+                        for candidate in candidates
+                    ],
+                })
+            else:
+                recommendation_ref.delete()
+
+            return result
+
+        context = recommendation_ref.get()
+        selected = None
+
+        if isinstance(context, dict):
+            for candidate in context.get("candidates") or []:
+                if not isinstance(candidate, dict):
+                    continue
+
+                name = candidate.get("name")
+                if not isinstance(name, str):
+                    continue
+
+                forms = {
+                    _normalize(name),
+                    _normalize(name + chr(0xC694)),
+                    _normalize(name + chr(0xB85C) + chr(0xC694)),
+                }
+
+                if normalized in forms:
+                    selected = candidate
+                    break
+
+        if selected is not None:
+            temperature = context.get("temperature")
+
+            if temperature not in ("hot", "ice"):
+                temperature = None
+
+            item = AnalyzedItem.model_validate({
+                "menu_id": selected["menuId"],
+                "menu_text": selected["name"],
+                "quantity": None,
+                "options": {
+                    "size": None,
+                    "temperature": temperature,
+                    "ice": None,
+                },
+            })
+
+            analysis = OrderAnalysis(
+                intent="add_item",
+                items=[item],
+            )
+            recommendation_ref.delete()
+
+        else:
+            if context is not None:
+                recommendation_ref.delete()
+
+            analysis = analyze_order_text(
+                store_id=store_id,
+                text=text,
+            )
 
 
     # 4. 변경·삭제·전체 비우기 명령
