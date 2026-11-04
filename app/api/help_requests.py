@@ -1,10 +1,12 @@
 """직원 호출 API."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import (
     HTTPAuthorizationCredentials,
     HTTPBearer,
 )
+
+from app.core.security import get_current_admin
 
 from app.schemas.help_requests import HelpRequestCreate
 from app.services.help_requests import (
@@ -63,31 +65,32 @@ def create_help_request_api(
             )
 
         raise
+
 @admin_router.get("")
 def read_help_requests(
-    store_id: str = Query(
-        alias="storeId",
-        min_length=1,
-    ),
+    admin: dict = Depends(get_current_admin),
 ):
-    """매장의 직원 호출 목록을 조회한다."""
+    """관리자 담당 매장의 직원 호출 목록을 조회한다."""
 
     requests = get_store_help_requests(
-        store_id=store_id
+        store_id=admin["storeId"]
     )
 
     return {
         "helpRequests": requests,
     }
+
 @admin_router.patch("/{request_id}")
 def complete_help_request_api(
     request_id: str,
-    store_id: str = Query(alias="storeId", min_length=1),
+    admin: dict = Depends(get_current_admin),
 ):
+    """관리자 담당 매장의 직원 호출을 완료 처리한다."""
+
     try:
         return finish_help_request(
             request_id=request_id,
-            store_id=store_id,
+            store_id=admin["storeId"],
         )
 
     except ValueError as exc:

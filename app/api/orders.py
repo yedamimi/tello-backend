@@ -1,7 +1,8 @@
 
 """주문 확정·조회 API."""
 
-from fastapi import APIRouter, Depends, Header, Path, Query
+from fastapi import APIRouter, Depends, Header, Path
+from app.core.security import get_current_admin
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -18,6 +19,7 @@ from app.services.orders import (
     get_order,
     update_order_status,
     get_orders,
+    get_admin_order,
 )
 
 router = APIRouter(
@@ -183,6 +185,7 @@ def change_order_status(
         alias="orderId",
         pattern=r"^[a-f0-9]{32}$",
     ),
+    admin: dict = Depends(get_current_admin),
 ):
     """주문 상태를 다음 단계로 변경한다."""
 
@@ -190,6 +193,7 @@ def change_order_status(
         return update_order_status(
             order_id=order_id,
             new_status=request.status,
+            store_id=admin["storeId"],
         )
 
     except ValueError as exc:
@@ -222,15 +226,39 @@ def change_order_status(
     response_model=OrderListResponse,
 )
 def read_orders(
-    store_id: str = Query(
-        alias="storeId",
-        min_length=1,
-    ),
+    admin: dict = Depends(get_current_admin),
 ):
-    """매장의 전체 주문 목록을 조회한다."""
+    """관리자 담당 매장의 전체 주문 목록을 조회한다."""
 
-    orders = get_orders(store_id=store_id)
+    orders = get_orders(store_id=admin["storeId"])
 
     return {
         "orders": orders,
     }
+@admin_router.get(
+    "/orders/{orderId}",
+    response_model=OrderReadResponse,
+)
+def read_admin_order(
+    order_id: str = Path(
+        alias="orderId",
+        pattern=r"^[a-f0-9]{32}$",
+    ),
+    admin: dict = Depends(get_current_admin),
+):
+    """관리자 담당 매장의 주문 상세 조회."""
+
+    try:
+        return get_admin_order(
+            order_id=order_id,
+            store_id=admin["storeId"],
+        )
+
+    except ValueError as exc:
+        if str(exc) == "ORDER_NOT_FOUND":
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "ORDER_NOT_FOUND"},
+            )
+
+        raise

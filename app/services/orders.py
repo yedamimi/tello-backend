@@ -342,6 +342,7 @@ def get_order(
 def update_order_status(
     order_id: str,
     new_status: str,
+    store_id: str,
 ) -> dict:
     """주문 상태를 다음 단계로 변경한다."""
 
@@ -362,6 +363,9 @@ def update_order_status(
         """주문 상태를 트랜잭션으로 변경한다."""
 
         if current is None:
+            raise ValueError("ORDER_NOT_FOUND")
+        
+        if current.get("storeId") != store_id:
             raise ValueError("ORDER_NOT_FOUND")
 
         if current.get("status") != "ordered":
@@ -463,3 +467,34 @@ def get_orders(store_id: str) -> list[dict]:
     )
 
     return orders
+def get_admin_order(
+    order_id: str,
+    store_id: str,
+) -> dict:
+    """관리자 담당 매장의 주문 상세 정보를 조회한다."""
+
+    session = get_db_reference(
+        f"sessions/{order_id}"
+    ).get()
+
+    if not isinstance(session, dict):
+        raise ValueError("ORDER_NOT_FOUND")
+
+    if session.get("status") != "ordered":
+        raise ValueError("ORDER_NOT_FOUND")
+
+    if session.get("storeId") != store_id:
+        raise ValueError("ORDER_NOT_FOUND")
+
+    order = session.get("order")
+
+    if not isinstance(order, dict):
+        raise ValueError("ORDER_NOT_FOUND")
+
+    order_data = dict(order)
+    order_data["orderId"] = order_id
+    order_data["imageId"] = get_status_image(
+        order_data["status"]
+    )
+
+    return order_data
