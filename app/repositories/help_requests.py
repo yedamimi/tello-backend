@@ -66,6 +66,8 @@ def get_help_requests(store_id: str) -> list[dict]:
 
     return result
 
+
+
 def complete_help_request(
     request_id: str,
     store_id: str
@@ -80,18 +82,19 @@ def complete_help_request(
 
     def update_request(current):
         if current is None:
-            return {
-                "_transaction_error": "NOT_FOUND"
-            }
+            raise ValueError("HELP_REQUEST_NOT_FOUND")
 
         if not isinstance(current, dict):
-            return current
+            raise ValueError("HELP_REQUEST_NOT_FOUND")
 
         if current.get("storeId") != store_id:
-            return current
+            raise ValueError("HELP_REQUEST_STORE_MISMATCH")
+
+        if current.get("status") == "completed":
+            raise ValueError("HELP_REQUEST_ALREADY_COMPLETED")
 
         if current.get("status") != "pending":
-            return current
+            raise ValueError("HELP_REQUEST_INVALID_STATUS")
 
         updated = dict(current)
         updated["status"] = "completed"
@@ -99,21 +102,4 @@ def complete_help_request(
 
         return updated
 
-    result = request_ref.transaction(update_request)
-
-    if not isinstance(result, dict):
-        raise ValueError("HELP_REQUEST_NOT_FOUND")
-
-    if result.get("_transaction_error") == "NOT_FOUND":
-        raise ValueError("HELP_REQUEST_NOT_FOUND")
-
-    if result.get("storeId") != store_id:
-        raise ValueError("HELP_REQUEST_STORE_MISMATCH")
-
-    if result.get("status") != "completed":
-        raise ValueError("HELP_REQUEST_INVALID_STATUS")
-
-    if result.get("completedAt") != now_ms:
-        raise ValueError("HELP_REQUEST_ALREADY_COMPLETED")
-
-    return result
+    return request_ref.transaction(update_request)
