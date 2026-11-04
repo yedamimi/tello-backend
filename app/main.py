@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.sessions import router as sessions_router
 from app.api.stores import router as stores_router
@@ -13,6 +14,17 @@ from app.api.help_requests import (
 )
 from app.api.admin import router as admin_router
 app = FastAPI(title="Tello Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+)
 
 app.include_router(sessions_router)
 app.include_router(stores_router)
