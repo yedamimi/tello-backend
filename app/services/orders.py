@@ -117,6 +117,19 @@ def _build_order(
     }
 
 
+def _normalize_order_response(order: dict) -> dict:
+    """Firebase?? ??? ? ?? ??? API ??? ????."""
+    result = dict(order)
+    result["items"] = [
+        {
+            **item,
+            "selectedOptions": item.get("selectedOptions") or {},
+        }
+        for item in result.get("items", [])
+    ]
+    return result
+
+
 def create_order(
     session_id: str,
     session_token: str,
@@ -161,7 +174,7 @@ def create_order(
             order = session.get("order")
 
             if order:
-                return order
+                return _normalize_order_response(order)
 
             raise ValueError("ORDER_CONFIRM_FAILED")
 
@@ -276,7 +289,7 @@ def create_order(
             saved_order = saved_session.get("order")
 
             if saved_order:
-                return saved_order
+                return _normalize_order_response(saved_order)
 
             raise ValueError("ORDER_CONFIRM_FAILED")
 
@@ -337,7 +350,7 @@ def get_order(
         order["status"]
     )
 
-    return order
+    return _normalize_order_response(order)
 
 def update_order_status(
     order_id: str,
@@ -459,7 +472,7 @@ def get_orders(store_id: str) -> list[dict]:
             order_data["status"]
         )
 
-        orders.append(order_data)
+        orders.append(_normalize_order_response(order_data))
 
     orders.sort(
         key=lambda order: order.get("createdAt", 0),
@@ -497,4 +510,4 @@ def get_admin_order(
         order_data["status"]
     )
 
-    return order_data
+    return _normalize_order_response(order_data)
