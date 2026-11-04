@@ -15,16 +15,24 @@ from app.api.help_requests import (
 from app.api.admin import router as admin_router
 app = FastAPI(title="Tello Backend")
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "ngrok-skip-browser-warning",
+    ],
 )
+
 
 app.include_router(sessions_router)
 app.include_router(stores_router)
