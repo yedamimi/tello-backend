@@ -1746,9 +1746,21 @@ def process_order_message(
     result["cart"] = None
     result["nextAction"] = None
 
+    # 이해하지 못한 발화는 재질문으로 안내
+    if result["intent"] == "unknown":
+        result["needsClarification"] = True
+        result["question"] = (
+            "말씀하신 내용을 정확히 이해하지 못했어요. "
+            "주문하실 메뉴나 원하시는 기능을 "
+            "다시 말씀해 주시겠어요?"
+        )
+        result["nextAction"] = "clarification"
+        return result
+
     # 주문 추가 외 의도
     if result["intent"] != "add_item":
         return result
+
 
     # 6. 미완성 주문이면 질문하고 대기
     if result["needsClarification"]:
